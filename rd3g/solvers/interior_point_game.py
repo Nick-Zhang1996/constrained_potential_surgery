@@ -1,0 +1,1934 @@
+"""Interior-point game solver built on CasADi."""
+# pylint: disable=invalid-name, forgotten-debug-statement
+
+import logging
+from dataclasses import dataclass, replace
+from itertools import accumulate
+from time import time
+
+import numpy as np
+import casadi as cas
+import qdldl
+from scipy.sparse import csc_matrix
+import scipy.sparse  # sparse matrix operations
+from scipy.sparse.linalg import lsqr, spsolve
+import scipy.linalg
+from scipy.linalg import norm
+import matplotlib.pyplot as plt
+
+from rd3g.core.base_solver import BaseSolver, BaseSolverConfig, Solution
+from rd3g.utilities.time_util import TimeUtil
+from rd3g.utilities.util import BASEDIR
+from rd3g.utilities.casadi_util import dm_to_csc
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+# change repr() of numpy floats to look like "1.23" instead of "np.float64(1.23)" for conciseness
+np.set_printoptions(legacy="1.25")
+
+
+def as_numpy_array(value):
+    """Convert array-like solver state to a dense numpy array."""
+    if hasattr(value, 'toarray'):
+        return value.toarray()
+    return np.asarray(value)
+
+
+def permutation_matrix_from_vector(P_vec):
+    """Create a sparse permutation matrix from a qdldl permutation vector."""
+    l = len(P_vec)
+    rows = np.arange(l)
+    cols = np.asarray(P_vec)
+    data = np.ones(l)
+    return csc_matrix((data, (rows, cols)), shape=(l, l))
+
+
+def reconstruct_qdldl_matrix(L_zero_diag, D_diag, P_vec):
+    """Reconstruct the original symmetric matrix from qdldl factors."""
+    n = len(D_diag)
+    P = permutation_matrix_from_vector(P_vec)
+    L = L_zero_diag + scipy.sparse.eye(n, format='csc')
+    D = scipy.sparse.diags(D_diag)
+    reconstructed = P.T @ L @ D @ L.T @ P
+    reconstructed = reconstructed.tocsc()
+    reconstructed.eliminate_zeros()
+    reconstructed.sort_indices()
+    reconstructed.sum_duplicates()
+    return reconstructed
+
+
+@dataclass
+class BrGameResult:
+    """ Result of a Best Response game (per agent game) """
+    is_optimal: bool
+    Ki: csc_matrix
+    Ki_reg: csc_matrix
+    dy_i: np.ndarray
+    L_zero_diag: csc_matrix
+    D_diag: np.ndarray
+    P_vec: np.ndarray
+    reg: float
+
+    def verify(self):
+        """ Verify the LDL decomposition of Ki_reg. """
+        # C = P @ Ki_reg @ P.T, C = L @ D @ L.T
+        P = self.get_P()
+        C_upper = scipy.sparse.triu(csc_matrix(P @ self.Ki_reg @ P.T),
+                                    format='csc')
+        C = scipy.sparse.triu(
+            reconstruct_qdldl_matrix(self.L_zero_diag, self.D_diag,
+                                     self.P_vec),
+            format='csc',
+        )
+        assert scipy.sparse.linalg.norm(C_upper - C) < 1e-10
+
+    def get_inv_D(self):
+        inv_D_diag = 1.0 / self.D_diag
+        invD = scipy.sparse.diags(inv_D_diag)
+        return invD
+
+    def get_L(self):
+        L = self.L_zero_diag + scipy.sparse.eye(self.L_zero_diag.shape[0])
+        return L
+
+    def get_P(self):
+        return permutation_matrix_from_vector(self.P_vec)
+
+
+def create_partial_identity(n, k):
+    """
+    Creates an n x n CSC matrix with the first k diagonal elements set to 1.
+    """
+    if k > n:
+        raise ValueError("k cannot be larger than n")
+    data = np.ones(k)
+    rows = np.arange(k)
+    cols = np.arange(k)
+    mat = scipy.sparse.csc_matrix((data, (rows, cols)), shape=(n, n))
+
+    return mat
+
+
+def check_inertia(D):
+    """ Check the inertia of block-diagonal matrix D.
+    Args:
+        D: block-diagonal matrix consisting of 1*1 and 2*2 blocks
+    Returns:
+        positive_eigenvalue_count
+        negative_eigenvalue_count
+        zero_eigenvalue_count
+    """
+    n = D.shape[0]
+    tol = 1e-5
+    i = 0
+    pos = 0
+    neg = 0
+    zero = 0
+
+    def count(pos, neg, zero, val):
+        if val > tol:
+            pos += 1
+        elif val < -tol:
+            neg += 1
+        else:
+            zero += 1
+        return pos, neg, zero
+
+    while i < n:
+        if i < n - 1 and abs(D[i, i + 1]) > tol:
+            # 2 by 2 block
+            eigvals = np.linalg.eigvalsh(D[i:i + 2, i:i + 2])
+            for val in eigvals:
+                pos, neg, zero = count(pos, neg, zero, val)
+            i += 2
+        else:
+            # 1 by 1 block
+            pos, neg, zero = count(pos, neg, zero, D[i, i])
+            i += 1
+    assert pos + neg + zero == n
+    return pos, neg, zero
+
+
+def solve_linear(A, b, method, profiler):
+    """ Solve for x in Ax = b, give x, residual, and inertia of A
+    Args:
+        A: (n,n) csc_matrix
+        b: (N,1) np.array
+    Return:
+        x: such that Ax-b is minimized
+        res: residual, |Ax-b|_2
+        inertia: (pos, neg, zero) number of positive, negative, zero eigenvals from LDL
+    """
+    p = profiler
+    if method == 'lsqr':
+        # Solve for reduced_dy
+        t0 = time()
+        x, istop, itn, normr = lsqr(A, b)[:4]
+        dt = time() - t0
+        residual = norm(normr)
+        istop_lut = {1: 'Direct Sol', 2: 'Least Square Sol', 7: 'Iter limit'}
+        logger.info(
+            f'Reduced stop:{istop_lut[istop]},{dt=}s {itn=}, {residual=}')
+
+        # Get inertia from LDL decomposition
+        # NOTE this only works for symmetric matrices
+        A_np = A.toarray()
+        lu, d, perm = scipy.linalg.ldl(A_np)
+        del lu
+        del perm
+        kkt_inertia = check_inertia(d)
+        logger.info(f'Reduced-system Inertia: {kkt_inertia}')
+        return x, residual, kkt_inertia
+    elif method == 'qdldl':
+        # NOTE only works for symmetric A
+        t0 = time()
+        p.s('pre-process')
+        A_upper = scipy.sparse.triu(A, format='csc')
+        A_upper.eliminate_zeros()
+        A_upper.sort_indices()
+        A_upper.sum_duplicates()
+        p.e('pre-process')
+        p.s('structural factorization')
+        # pylint:disable-next=c-extension-no-member
+        solver = qdldl.Solver(A_upper, upper=True)
+        p.e('structural factorization')
+        #  C = P @ A @ P.T, C = L @ D @ L.T
+        p.s('retrieve factorization')
+        L_zero_diag, D_diag, P_vec = solver.factors()
+        del L_zero_diag
+        del P_vec
+        p.e('retrieve factorization')
+        p.s('numerical solution')
+        qdldl_x = solver.solve(b)
+        p.e('numerical solution')
+        pos = np.sum(D_diag > 0)
+        neg = np.sum(D_diag < 0)
+        qdldl_inertia = (pos, neg, len(D_diag) - pos - neg)
+        p.s('post-processing')
+        # residual = norm(A @ qdldl_x - b)  # 30 % of total time!, use csc_matrix
+        b_csc = scipy.sparse.csc_matrix(b.reshape(-1, 1))
+        qdldl_x_csc = scipy.sparse.csc_matrix(qdldl_x.reshape(-1, 1))
+        residual = scipy.sparse.linalg.norm(A @ qdldl_x_csc - b_csc)
+        p.e('post-processing')
+        dt = time() - t0
+        # logger.info(f'Reduced LDL ,{dt=:.6f}s {residual=:.6f}')
+        return qdldl_x, residual, qdldl_inertia
+    elif method == 'spsolve':
+        spsolve_x = spsolve(A, b)
+        b_csc = scipy.sparse.csc_matrix(b.reshape(-1, 1))
+        spsolve_x_csc = scipy.sparse.csc_matrix(spsolve_x.reshape(-1, 1))
+        residual = scipy.sparse.linalg.norm(A @ spsolve_x_csc - b_csc)
+        # inertia is not supported
+        return spsolve_x, residual, None
+
+
+def ldl_solve(A, b, profiler, solver=None, A_upper=None):
+    """ Solve a symmetric problem with LDL.
+    Args:
+        solver: if provided, reuse structural factorization.
+        A_uppper: if provided, ignore A.  Also assumes solver already contains A.
+    """
+    p = profiler
+    if A_upper is None:
+        p.s('pre-process')
+        A_upper = scipy.sparse.triu(A, format='csc')
+        A_upper.eliminate_zeros()
+        A_upper.sort_indices()
+        A_upper.sum_duplicates()
+        if solver is not None:
+            solver.update(A_upper, upper=True)
+        p.e('pre-process')
+
+    if solver is None:
+        p.s('structural factorization')
+        # pylint:disable-next=c-extension-no-member
+        solver = qdldl.Solver(A_upper, upper=True)
+        p.e('structural factorization')
+    #  C = P @ A @ P.T, C = L @ D @ L.T
+    p.s('Solve linear sys')
+    qdldl_x = solver.solve(b)
+    p.e('Solve linear sys')
+    # residual = norm(A @ qdldl_x - b)  # 30 % of total time!, use csc_matrix below
+    # p.s('Calc residual')
+    # b_csc = scipy.sparse.csc_matrix(b.reshape(-1, 1))
+    # qdldl_x_csc = scipy.sparse.csc_matrix(qdldl_x.reshape(-1, 1))
+    # residual = scipy.sparse.linalg.norm(A @ qdldl_x_csc - b_csc)
+    # p.e('Calc residual')
+    res = None  # Expensvie to calculate and always machine precision
+    return qdldl_x, res, solver, A_upper
+
+
+@dataclass(frozen=True)
+class InteriorPointGameConfig(BaseSolverConfig):
+    """Configuration for the interior-point game solver.
+
+    NOTE: Some changes here require rerunning codegen and recompiling the C++ module.
+    """
+    tolerance: float = 5e-4  # 1e-5  # 5e-4 in benchmark
+    """ The residual threhold for stopping solver iterations. """
+    iterations: int = 20  # 20 in benchmark
+    """ Maximum solver iterations before giving up. """
+    # Line search params
+    bc_a: float = 1e-4
+    """ alpha, minimal acceptable residual improvement in line search """
+    bc_b: float = 0.5
+    """ beta, shrink coefficient for step size after a failed step """
+    line_search_max_iter: int = 10
+    """ Max line search iterations. """
+    reg: float = 0
+    """ Initial Levenberg-Marquardt Regularization Coefficient for main KKT"""
+    reg_inertia: float = 1e-5
+    """ Initial Levenberg-Marquardt Regularization Coefficient for agent KKT. 
+    Necessary for AMD pivoting to work. """
+    inertia_correction: bool = False
+    """ Apply inertia correction to each agent KKT """
+    inertia_correction_base: float = 1
+    """ target regularization """
+    inertia_correction_classic: bool = False
+    """ Use escalating rather than binary-search inertia correction. """
+    inertia_correction_classic_start: float = 1e-3
+    """ Initial primal regularization for classic inertia correction. """
+    inertia_correction_classic_scale: float = 10.0
+    """ Multiplier for each failed classic inertia-correction attempt. """
+    abs_split: bool = False
+    """ Replace the primal Hessian block H=S+A with |S|+A when S is indefinite """
+    reduce_kkt_system: bool = False
+    """ Eliminate equality-constrained variables before solving the main KKT system """
+    keep_only_active_constraints_in_ki: bool = True
+    """ Remove inactive h rows and associated mu columns before checking K_i inertia """
+    rollout_each_step: bool = False
+    """ Rollout control to get new state trajectory at the start of each solver iter """
+    precondition_with_potential: bool = False
+    """ Precondition the game KKT with a potential KKT to speed up computing"""
+    ablation_level: int = 0
+    """PDO ablation: 0=split + LDL, 1=direct sparse LU, 2=direct dense LU (vGNE)."""
+    check_spectral_radius: bool = False
+    """ Check Spectral radius of inv(S)A in a numerically efficient way to ensure convergence"""
+    variational_gne: bool = True
+    """ If True, use one shared multiplier per canonical constraint """
+    max_in_reg_iter: int = 20  # 10
+    """ Inertia correction max iterations """
+    max_in_reg_val: float = 1000.0
+    """ Maximum inertia regularization """
+    linear_solver_method: str = 'sparselu'  # lscg, ldl, lsqr, sparselu, superlu, umfpack
+    """ Sparse linear solver used by the C++ backend """
+    max_failed_line_search: int = 3
+    """ Number of solver steps with line search failure before solver stops trying """
+    tau_decay: float = 0.2
+    """ Coefficient to shrink complementary slackness"""
+
+    def __post_init__(self):
+        if self.inertia_correction and self.inertia_correction_classic:
+            raise ValueError(
+                'inertia_correction and inertia_correction_classic are mutually exclusive'
+            )
+        assert 0 <= self.ablation_level <= 2, 'ablation_level must be in [0, 2]'
+        # Level zero leaves ordinary IPM configurations untouched.  The
+        # nonzero levels are meaningful only as ablations of PDO's split.
+        if self.ablation_level:
+            assert self.precondition_with_potential, (
+                'PDO ablations require precondition_with_potential=True; '
+                'use ablation_level=0 for other modes')
+            assert self.variational_gne, (
+                'ablation levels 1 and 2 retain the vGNE formulation')
+
+
+class LineSearchMaxIter(Exception):
+    """ Max iteration in line search is reached without a good step size"""
+
+
+class LineSearchSuccess(Exception):
+    """ Line search found a step size that gives adequate residual reduction """
+
+
+class InteriorPointGame(BaseSolver):
+    """Interior-point game solver with CasADi-backed derivatives.
+
+    Attributes:
+        config (InteriorPointGameConfig): Configuration dataclass to
+            specify solver iterations, cpp binary, tolerance etc.
+        N (int): Number of agents
+        T (int): Horizon length
+        dt (float): Time step length
+        n (int): Dimension of state for a single agent
+        m (int): Dimension of control for a single agent
+        x0 (np.ndarray): [N, n] Initial State for all agents
+        # guess (np.ndarray): [T,N,m] Initial guess for control traj
+
+    """
+
+    def __init__(self, config: InteriorPointGameConfig, game, cpp_only=False):
+        """ cpp_only: if True, skip constructing casadi function construction """
+        BaseSolver.__init__(self, config, game)
+
+        gc = self.game.config
+        self.N = gc.N
+        self.T = gc.T
+        self.dt = gc.dt
+        self.n = gc.n
+        self.m = gc.m
+        self.n_h = getattr(gc, 'n_h', getattr(gc, 'n_hi', 0))
+        assert gc.variational_gne == config.variational_gne, \
+            'Game and Solver must have the same variational_gne setting'
+        self.variational_gne = config.variational_gne
+        self.n_c = gc.n_c
+
+        # Levenberg-Marquardt Regularization
+        # When line search is stuck, coeff is increased. Re-sets when line search succeeds.
+        self.reg = self.config.reg
+        self.line_search_fail_count = 0
+        self.profiler = TimeUtil(True)
+
+        self.residual_vec = []
+        self.validate()
+
+        # Construct CasADi objects, ~3 seconds
+        # Leave this for users, since if cpp backend is loaded this won't be needed
+        if not cpp_only:
+            self.construct_casadi_fun()
+        self.cpp_solver = None
+
+    def validate(self):
+        assert isinstance(self.n, int) and self.n > 0
+        assert isinstance(self.m, int) and self.m > 0
+        assert isinstance(self.T, int) and self.T > 0
+        assert isinstance(self.N, int) and self.N > 0
+        gc = self.game.config
+        assert gc.x0.shape == (self.n, self.N)
+        return
+
+    @property
+    def h_multiplier_cols(self):
+        return 1 if self.variational_gne else self.N
+
+    @property
+    def dual_h_dim(self):
+        return self.n_h * self.h_multiplier_cols
+
+    def construct_casadi_fun(self):
+        """ Construct functions based on CasADi autodiff"""
+        gc = self.game.config
+        N = gc.N
+        n = gc.n
+        m = gc.m
+        T = gc.T
+        n_h = self.n_h
+        h_cols = self.h_multiplier_cols
+        # context: (n_c*N, T) Game context, changes between iteration,
+        # but constant within iteration.
+        #     This contains variables too expensive to AD.
+        #     e.g. path curvature at each player position.
+        context = self.game.context.get_context_sx()
+        logger.info('Constructing CasADi functions... ')
+
+        # NOTE: casadi only works with 2D matrices, we combine n,N into first dimension
+        # Slicing columns is more efficient in casadi, therefore we put T in the column dimension
+        # Conceptually, the three dimensions are stacked in order of n, N, T
+        # To obtain x_i_k, do this: cas.reshape(x[:,k], n, N)[:,i], note the column major storage
+        # This results in a slice that's continuous in memory
+        x = cas.SX.sym('x', n * N, T)
+        u = cas.SX.sym('u', m * N, T)
+        # Lagrang multiplier for equality constraints, we only have dynamics constraint
+        lamda = cas.SX.sym('lamda', n * N, T)
+        # Lagrange multipliers for inequality constraints.
+        # Non-variational mode uses one multiplier column per agent.
+        # Variational mode uses one shared multiplier column.
+        mu = cas.SX.sym('mu', n_h * h_cols, 1)
+        x0 = cas.SX.sym('x0', n, N)
+        config_params = [gc.get_int_param_sx(), gc.get_double_param_sx()]
+
+        args = [x, u, lamda, mu, context]
+
+        self.get_n_fun = cas.Function('get_n', [], [self.n])
+        self.get_m_fun = cas.Function('get_m', [], [self.m])
+
+        # Check for nans
+        # opts = {'regularity_check': True}
+        opts = {}
+        h_val = self.game.h(x, u, context)
+        self.h_casadi = cas.Function('h', [x, u, context] + config_params,
+                                     [h_val], opts)
+
+        r_val, h_val = self.r(*args)
+        self.r_casadi = cas.Function('r', args + config_params, [r_val, h_val],
+                                     opts)
+
+        y = cas.vertcat(*[cas.vec(val) for val in [x, u, lamda, mu]])
+        dr_dy = cas.jacobian(r_val, y)
+        self.dr_dy_casadi = cas.Function('dr_dy', args + config_params,
+                                         [dr_dy], opts)
+
+        X = self.game.rollout(x0, u)
+        self.rollout_casadi = cas.Function('rollout', [x0, u] + config_params,
+                                           [X])
+
+        xki = cas.SX.sym('xki', n, 1)
+        xkj = cas.SX.sym('xkj', n, 1)
+        col_h_val = self.game.collision_h(xki, xkj)
+        self.collision_h_casadi = cas.Function('collision_h',
+                                               [xki, xkj] + config_params,
+                                               [col_h_val])
+
+        # Construct KKT matrix for K_i
+        # To obtain x_i_k, do this: , note the column major storage
+        self.ri_casadi_vec = []
+        self.Ki_casadi_vec = []
+        for i in range(N):
+            xik_vec = [cas.reshape(x[:, k], n, N)[:, i] for k in range(T)]
+            xi = cas.vertcat(*xik_vec)
+            uik_vec = [cas.reshape(u[:, k], m, N)[:, i] for k in range(T)]
+            ui = cas.vertcat(*uik_vec)
+            lamdaik_vec = [
+                cas.reshape(lamda[:, k], n, N)[:, i] for k in range(T)
+            ]
+            lamdai = cas.vertcat(*lamdaik_vec)
+            mui = cas.reshape(mu, n_h,
+                              h_cols)[:, 0 if self.variational_gne else i]
+            args_i = [xi, ui, lamdai, mui]
+            hi_vals = h_val[:, 0 if self.variational_gne else i]
+            yi = cas.vertcat(*[cas.vec(val) for val in args_i])
+            L = self.LLi(x, u, lamda, mu, i, hi_vals, context)
+            ri = cas.jacobian(L, yi)
+            self.ri_casadi_vec.append(
+                cas.Function(f'r_{i}', args + config_params, [ri]))
+            Ki = cas.jacobian(ri, yi)
+            self.Ki_casadi_vec.append(
+                cas.Function(f'K_{i}', args + config_params, [Ki]))
+
+        context_val = self.game.get_context(xki)
+        # Get game context for one state (n,1) -> (n_c,1)
+        self.get_context_casadi = cas.Function('get_context', [xki],
+                                               [context_val])
+
+        # (n, N) -> (n_c, N)
+        get_context_n_N = self.get_context_casadi.map(N)
+
+        def get_context_nN(xnN):
+            x_n_N = cas.reshape(xnN, n, N)
+            return cas.reshape(get_context_n_N(x_n_N), self.n_c * self.N, 1)
+
+        xnN = cas.SX.sym('xnN', n * N, 1)
+        get_context_nN_casadi = cas.Function('get_context_nN', [xnN],
+                                             [get_context_nN(xnN)])
+        # (nN, T) -> (N, T)
+        get_context_nN_T = get_context_nN_casadi.map(T)
+        full_context_val = get_context_nN_T(x)
+
+        # Get game context for whole state (nN, T) -> (n_c*N, T)
+        self.get_full_context_casadi = cas.Function('get_full_context', [x],
+                                                    [full_context_val])
+
+        logger.info('Constructing CasADi functions... Done')
+
+    def init_cpp_backend(self):
+        """ Load CPP solver"""
+        # logger.error("Build directory %s not found. Did you compile?", build_dir)
+        # pylint:disable-next=import-outside-toplevel, no-name-in-module
+        from build.lib import interior_point_game
+        # The source code need to be generated and compiled before the following code can be run
+
+        # Load compiled solver, compare results
+        # Example for sending matrices to/from casadi
+        game = self.game
+        module_name = game.__module__.rsplit('.', maxsplit=1)[-1]
+        solver_config = self.config
+
+        try:
+            # pylint:disable-next=c-extension-no-member
+            self.cpp_solver = interior_point_game.InteriorPointGame(
+                game.config.N,
+                game.config.T,
+                getattr(game.config, 'n_h', getattr(game.config, 'n_hi', 0)),
+                game.config.dt,
+                solver_config.bc_a,
+                solver_config.bc_b,
+                solver_config.reg,
+                solver_config.reg_inertia,
+                solver_config.inertia_correction,
+                solver_config.inertia_correction_base,
+                solver_config.inertia_correction_classic,
+                solver_config.inertia_correction_classic_start,
+                solver_config.inertia_correction_classic_scale,
+                solver_config.keep_only_active_constraints_in_ki,
+                solver_config.abs_split,
+                solver_config.rollout_each_step,
+                solver_config.precondition_with_potential,
+                solver_config.ablation_level,
+                solver_config.variational_gne,
+                solver_config.tolerance,
+                solver_config.tau_decay,
+                solver_config.line_search_max_iter,
+                solver_config.max_failed_line_search,
+                solver_config.iterations,
+                solver_config.max_in_reg_iter,
+                solver_config.max_in_reg_val,
+                solver_config.linear_solver_method,
+                0,  # 0:error, 1:warning, 2:info, 3:debug
+                BASEDIR,
+                module_name)
+        except RuntimeError as e:
+            if 'Cannot load shared library' in str(e):
+                logger.error(
+                    'CasADi Failed to load dll, make sure its compiled')
+            raise
+
+    def solve_cpp_backend(self, u_ref=None):
+        if self.cpp_solver is None:
+            logger.error('Call init_cpp_backend() first')
+            raise RuntimeError
+        x0 = self.game.config.x0
+
+        gc = self.game.config
+        params_np = [gc.get_int_param_np(), gc.get_double_param_np()]
+
+        if u_ref is None:
+            u_ref = np.zeros((self.m * self.N, self.T), order='F')
+        assert np.isfortran(x0)
+        assert np.isfortran(u_ref)
+        # x0 is still passed explicitly for rollout generation, while the config parameters
+        # provide the symbolic x0 used inside the generated CasADi functions.
+
+        t0 = time()
+        # reduced_dy, res, inertia = self.cpp_solver.solve(x0, u_ref, *params_np)
+        retval = self.cpp_solver.solve(x0, u_ref, *params_np)
+        x, u, lamda, mu, residual, has_converged, is_optimal, i, msg = retval
+        self.residual_vec = self.cpp_solver.get_residual_history()
+        dt = time() - t0
+        del lamda
+        del mu
+        del msg
+        logger.debug(f"cpp solve() took: {dt:.6f}s")
+
+        return Solution(elapsed_time=dt,
+                        iterations=i,
+                        u=u,
+                        x=x,
+                        residual=float(residual),
+                        has_converged=has_converged,
+                        is_optimal=is_optimal)
+
+    def solve_cpp_backend_rand_restart(self, restarts=0, u_ref=None, control_std=None):
+        """Try the usual control guess, then up to ``restarts`` random guesses.
+
+        Keep the physical game fixed. Stop at a converged, optimal solution;
+        otherwise retain the best converged solution and its residual history.
+        Elapsed time includes every attempt. ``control_std`` specifies the noise
+        scale of zero-mean Gaussian noise in the game's control order.
+        """
+        if self.cpp_solver is None:
+            logger.error('Call init_cpp_backend() first')
+            raise RuntimeError
+        if restarts < 0:
+            raise ValueError('restarts must be nonnegative')
+        if restarts:
+            if control_std is None:
+                raise ValueError('control_std is required for random restarts')
+            control_std = np.asarray(control_std, dtype=float)
+            if control_std.shape != (self.m,):
+                raise ValueError(f'control_std must contain {self.m} values in game control order')
+            if not np.isfinite(control_std).all() or np.any(control_std < 0):
+                raise ValueError('control_std values must be finite and nonnegative')
+        base_guess = (np.zeros((self.m * self.N, self.T), order='F') if u_ref
+                      is None else np.array(u_ref, dtype=float, order='F'))
+        self.restart_attempts = []
+        best_solution = None
+        best_score = None
+
+        t0 = time()
+        for attempt in range(restarts + 1):
+            guess = base_guess
+            if attempt:
+                raw_samples = np.random.normal(loc=0, scale=control_std,
+                                                size=(self.N, self.T, self.m))
+                # CasADi rows interleave controls within each agent.
+                perturbation = raw_samples.transpose(2, 0, 1).reshape(
+                    (self.m * self.N, self.T), order='F')
+                guess = np.array(base_guess + perturbation, order='F')
+            solution = self.solve_cpp_backend(guess)
+            history = list(self.residual_vec)
+            self.restart_attempts.append({
+                'attempt':
+                attempt,
+                'runtime_s':
+                float(solution.elapsed_time),
+                'is_converged':
+                bool(solution.has_converged),
+                'is_optimal':
+                bool(solution.is_optimal),
+                'residual':
+                float(solution.residual),
+                'iterations':
+                len(history),
+                'residual_history':
+                history,
+            })
+            residual = solution.residual if np.isfinite(
+                solution.residual) else np.inf
+            score = (solution.has_converged, solution.has_converged
+                     and solution.is_optimal, -residual)
+            if best_score is None or score > best_score:
+                best_solution, best_score = solution, score
+                self.restart_selected_attempt = attempt
+            if solution.is_optimal and solution.has_converged:
+                break
+        self.residual_vec = self.restart_attempts[
+            self.restart_selected_attempt]['residual_history']
+        return replace(best_solution, elapsed_time=time() - t0)
+
+    def solve(self, u_ref=None):
+        gc = self.game.config
+        N = gc.N
+        T = gc.T
+        n = gc.n
+        m = gc.m
+        dual_h_dim = self.dual_h_dim
+        x0 = gc.x0
+        # y: x(n*N*T), u(m*N*T), lambda(n*N*T), mu(dual_h_dim)
+        logger.debug(
+            f'Primal variables:{(T*N*n) + (T*N*m)} Dual variables:{(N*T*n)+dual_h_dim}'
+        )
+        params_np = [gc.get_int_param_np(), gc.get_double_param_np()]
+        tau = 0.1  # Perturbed complementary slackness mu * s = tau > 0, homotopy param -> 0
+
+        if u_ref is None:
+            u = np.zeros((m * N, T), order='F')
+        else:
+            u = u_ref
+        # x = x_1 .. x_T, NOTE the array index is offset from the math notation
+        # (n*N, T)
+        x = self.rollout_casadi(x0, u, *params_np)
+        # x = self.cpp_solver.rollout(x0, u, *params_np)
+        # To convert to np array
+        # np.asarray(x_ref, order='F'),reshape(n,N,T, order='F') -> (n, N, T)
+        context = self.get_full_context_casadi(x)
+
+        # self.h_casadi = cas.Function('h', [x, u, context]+config_params, [h_val], opts)
+        h_val = self.h_casadi(x, u, context, *params_np)
+        # Slack variable h(x,u) + s = 0, s>=0
+        s = cas.fmax(1e-2, -cas.reshape(h_val, dual_h_dim, 1))
+        mu = tau / s  # Multiplier for h(x,u) + s
+        lamda = cas.DM.zeros((n * N, T))  # Multiplier for dynamics constraints
+        filter_state = []
+
+        i = 0
+        converged = False
+        optimal = False
+        self.line_search_fail_count = 0
+        msg = 'Max iteration has been reached'
+        t0 = time()
+        for i in range(self.config.iterations):
+            logger.info(f'--- iter {i} ---')
+            if self.config.rollout_each_step:
+                x = self.rollout_casadi(x0, u, *params_np)
+            x, u, lamda, mu, s, res, converged, optimal, filter_state, _ = self.step(
+                x, u, lamda, mu, s, filter_state, tau)
+
+            current_gap = np.sum(np.asarray(s) * np.asarray(mu)) / dual_h_dim
+            tau = max(1e-8, self.config.tau_decay * current_gap)
+            logger.debug('Perturbed Complementary Slackness: tau=%.8f', tau)
+            if converged:
+                break
+            if self.line_search_fail_count >= self.config.max_failed_line_search:
+                msg = 'Line search no progress'
+                break
+        dt = time() - t0
+        if converged and optimal:
+            msg = 'Converged to NE'
+        elif converged and not optimal:
+            msg = 'Converged to saddle point'
+
+        logger.info(f'Stop after {i} iteration because {msg}')
+
+        # u_ref: m*N, T
+        # sol.u: T,N,m
+        # xn*N, T
+        # sol.x: T,N,n
+        return Solution(elapsed_time=dt,
+                        iterations=i,
+                        u=as_numpy_array(u).reshape((m, N, T), order='F'),
+                        x=as_numpy_array(x).reshape((n, N, T), order='F'),
+                        residual=res,
+                        has_converged=converged,
+                        is_optimal=optimal)
+
+    def check_agent_kkt_inertia(self, x, u, lamda, mu, context, h_val, params):
+        """Form every agent KKT matrix and apply the solver's inertia test.
+
+        This is the second-order optimality check used by :meth:`step`.  It is
+        also intentionally callable for an externally supplied primal
+        trajectory, such as an ALGames result, so that both paths use the
+        exact same KKT assembly, active-set reduction, regularization, and
+        inertia criterion.
+
+        Args:
+            x: State trajectory with shape ``(n * N, T)``.
+            u: Control trajectory with shape ``(m * N, T)``.
+            lamda: Dynamics multipliers with shape ``(n * N, T)``.
+            mu: Inequality multipliers with shape ``(dual_h_dim, 1)``.
+            context: Context evaluated along ``x``.
+            h_val: Inequality values evaluated at ``(x, u, context)``.
+            params: Integer and floating-point game parameter vectors.
+
+        Returns:
+            ``(is_optimal, saddle_agent_idx, br_game_vec)``.  ``is_optimal``
+            is true only when each agent's regularized KKT matrix has the
+            expected inertia.
+        """
+        args = [x, u, lamda, mu, context, *params]
+        primal_var_count = (self.n + self.m) * self.T
+        is_optimal = True
+        saddle_agent_idx = []
+        br_game_vec = []
+
+        for i in range(self.N):
+            # Construct KKT matrix for agent i K_i.
+            Ki = dm_to_csc(self.Ki_casadi_vec[i](*args))
+            ri = self.ri_casadi_vec[i](*args)
+            # self.check_Ki(Ki)
+
+            Ki_for_inertia = Ki
+            ri_for_inertia = ri.toarray()
+            active_ki_indices = None
+            if self.config.keep_only_active_constraints_in_ki:
+                h_i_val = h_val[:, 0 if self.variational_gne else i]
+                Ki_for_inertia, ri_for_inertia, active_ki_indices = (
+                    self.reduce_ki_to_active_constraints(
+                        Ki, ri_for_inertia, h_i_val))
+
+            # Apply Levenberg-Marquardt regularization to the primal block and
+            # constraint relaxation to the dual block.
+            ind = np.arange(primal_var_count)
+            reg_matrix = scipy.sparse.eye(Ki_for_inertia.shape[0],
+                                          format="csc")
+            reg_matrix[ind, ind] = self.config.reg_inertia
+            ind = np.arange(primal_var_count, Ki_for_inertia.shape[0])
+            reg_matrix[ind, ind] = -self.config.reg_inertia
+            Ki_reg = Ki_for_inertia + reg_matrix
+
+            in_Ki, solver = self.get_inertia(Ki_reg)
+            reduced_dy_i = solver.solve(-ri_for_inertia)
+            if active_ki_indices is None:
+                dy_i = reduced_dy_i
+            else:
+                dy_i = np.zeros((Ki.shape[0], 1))
+                dy_i[active_ki_indices,
+                     0] = np.asarray(reduced_dy_i).reshape(-1)
+
+            exp_in_Ki = (primal_var_count, Ki_reg.shape[0] - primal_var_count,
+                         0)
+            # logger.debug(f'K{i} inertia {in_Ki}, optimal {exp_in_Ki}')
+            L_zero_diag, D_diag, P_vec = solver.factors()
+
+            reg = 0
+            if in_Ki != exp_in_Ki:
+                is_optimal = False
+                saddle_agent_idx.append(i)
+                if self.config.inertia_correction or self.config.inertia_correction_classic:
+                    data = np.full(primal_var_count, 1)
+                    indices = np.arange(primal_var_count)
+                    I_H = scipy.sparse.csc_matrix((data, (indices, indices)),
+                                                  shape=Ki_reg.shape)
+                    if self.config.inertia_correction_classic:
+                        # Classic strategy: increase regularization geometrically.
+                        reg = self.config.inertia_correction_classic_start
+                        reg_inertia, _ = self.get_inertia(Ki_reg + reg * I_H)
+                        for reg_iter in range(self.config.max_in_reg_iter):
+                            if reg_inertia == exp_in_Ki:
+                                break
+                            reg *= self.config.inertia_correction_classic_scale
+                            reg_inertia, _ = self.get_inertia(Ki_reg +
+                                                              reg * I_H)
+                        if reg_inertia != exp_in_Ki:
+                            logger.warning(
+                                f'Fail to correct K{i} inertia: {reg_inertia}, {reg_iter=}, {reg=}'
+                            )
+                        else:
+                            logger.debug(
+                                f'corrected K{i} with classic inertia correction '
+                                f'{reg_iter=}, {reg=}')
+                    else:
+                        # Binary search to find minimal reg to correct inertia.
+                        reg_upper = 2.0  # Gives good inertia
+                        reg_lower = 1.0  # Gives bad inertia
+                        reg_upper_in, _ = self.get_inertia(Ki_reg +
+                                                           reg_upper * I_H)
+                        reg_lower_in, _ = self.get_inertia(Ki_reg +
+                                                           reg_lower * I_H)
+                        reg_iter = 0
+                        for reg_iter in range(self.config.max_in_reg_iter):
+                            if reg_upper_in != exp_in_Ki:  # Inc upper bound
+                                reg_lower = reg_upper
+                                reg_lower_in = reg_upper_in
+                                reg_upper *= 2
+                                reg_upper_in, _ = self.get_inertia(Ki_reg +
+                                                                   reg_upper *
+                                                                   I_H)
+                            elif reg_lower_in == exp_in_Ki:  # Dec lower bound
+                                reg_upper = reg_lower
+                                reg_upper_in = reg_lower_in
+                                reg_lower /= 2
+                                reg_lower_in, _ = self.get_inertia(Ki_reg +
+                                                                   reg_lower *
+                                                                   I_H)
+                            else:
+                                reg_middle = (reg_upper + reg_lower) / 2
+                                reg_middle_in, _ = self.get_inertia(
+                                    Ki_reg + reg_middle * I_H)
+                                if reg_middle_in == exp_in_Ki:
+                                    reg_upper = reg_middle
+                                    reg_upper_in = reg_middle_in
+                                else:
+                                    reg_lower = reg_middle
+                                    reg_lower_in = reg_middle_in
+                            if (reg_upper - reg_lower) / reg_upper < 1e-4:
+                                break
+                            if reg_upper > self.config.max_in_reg_val:
+                                reg_upper = self.config.max_in_reg_val
+                                break
+                        reg = reg_upper + self.config.inertia_correction_base
+                        if reg_upper_in != exp_in_Ki:
+                            logger.warning(
+                                f'Fail to correct K{i} inertia: {reg_upper_in}, {reg_iter=}, {reg=}'
+                            )
+                        else:
+                            logger.debug(f'corrected K{i} {reg_iter=}, {reg=}')
+
+            br_game_vec.append(
+                BrGameResult(is_optimal, Ki, Ki_reg, dy_i, L_zero_diag, D_diag,
+                             P_vec, reg))
+
+        return is_optimal, saddle_agent_idx, br_game_vec
+
+    def step(self, x, u, lamda, mu, s, filter_state, tau):
+        """ Solver step function
+        Args:
+            x: n*N,T, casadi.DM
+            u: m*N,T
+            lamda: n*N,T
+            mu: (dual_h_dim, 1)
+            s: (dual_h_dim, 1) slack variable
+            filter_state: list[(infeasibility, residual)] Previously rejected states
+            tau: float, Perturbed complementary slackness
+        Return:
+            x:
+            u:
+            lamda:
+            mu:
+            s: updated primal/dual variables
+            res: residual
+            converged: Bool for algorithm converged, residual < threshold
+            is_optimal: Bool for algorithm has correct inertia for PD projected hessian
+            filter_state: Updated filter for line search
+            debug_dict: Dict of process variables
+        """
+        p = self.profiler
+        p.s()
+        p.s('prep')
+        gc = self.game.config
+        N = gc.N
+        T = gc.T
+        n = gc.n
+        m = gc.m
+        dual_h_dim = self.dual_h_dim
+        nNT = n * N * T
+        mNT = m * N * T
+
+        int_param_dm = cas.DM(gc.get_int_param_np())
+        double_param_dm = cas.DM(gc.get_double_param_np())
+        params_dm = [int_param_dm, double_param_dm]
+        context_dm = self.get_full_context_casadi(x)
+        args = [x, u, lamda, mu, context_dm, *params_dm]
+        p.e('prep')
+
+        p.s('Form KKT')
+        r0_val, h_val = self.r_casadi(*args)
+        dr_dy_val = self.dr_dy_casadi(*args)
+        # Add eliminated slack variable as a function of mu
+        LHS = dr_dy_val
+        mu_offset = nNT + mNT + nNT
+        LHS[mu_offset:, mu_offset:] += -cas.diag(s / mu)
+        RHS = -r0_val
+        RHS[mu_offset:, 0] += -tau / mu
+
+        RHS_np = np.asarray(RHS)
+        p.e('Form KKT')
+
+        p.s('Inertia Checking')
+        is_optimal, saddle_agent_idx, br_game_vec = self.check_agent_kkt_inertia(
+            x, u, lamda, mu, context_dm, h_val, params_dm)
+        p.e('Inertia Checking')
+        reg_vec = [val.reg for val in br_game_vec]
+        logger.info(f'Saddle agents: {saddle_agent_idx}, reg: {reg_vec}')
+
+        primal_var_count = (n + m) * N * T
+        LHS_csc = dm_to_csc(LHS)
+        if self.config.abs_split:
+            LHS_csc = self.apply_abs_split_to_game_kkt(LHS_csc)
+
+        if self.config.inertia_correction or self.config.inertia_correction_classic:
+            # Inertia correcting regularization
+            in_reg_mtx = self.make_full_KKT_reg(reg_vec)
+            LHS_csc += in_reg_mtx
+
+        # size of x, u, lamda, mu
+        sizes = [0, n * N * T, m * N * T, n * N * T, dual_h_dim]
+        offsets = list(accumulate(sizes))
+
+        use_pdo_split = (self.config.precondition_with_potential
+                         and self.config.ablation_level == 0)
+        if use_pdo_split:
+            self.reg = self.config.reg_inertia
+        # Apply Levenberg-Marquardt Regularization
+        # H = H + reg * I
+        ind = np.arange(primal_var_count)
+        reg_matrix = scipy.sparse.eye(LHS_csc.shape[0], format="csc")
+        reg_matrix[ind, ind] = self.reg
+        # Apply constraint relaxation to allow AMD permutation in LDL
+        ind = np.arange(primal_var_count, LHS_csc.shape[0])
+        reg_matrix[ind, ind] = -self.reg
+        LHS_csc += reg_matrix
+        RHS_np = np.asarray(RHS)
+
+        if use_pdo_split:
+            p.s('Precondition')
+            p.s('prep')
+            LHS_csc_T = LHS_csc.T
+            S_csc = (LHS_csc + LHS_csc_T) * 0.5
+            A_csc = (LHS_csc - LHS_csc_T) * 0.5
+            p.e('prep')
+
+            dy = np.zeros((2 * nNT + mNT + dual_h_dim, 1))
+            t0 = time()
+            A_upper = None
+            solver = None
+            last_residual = np.inf
+            for i in range(10):
+                iter_LHS = S_csc
+                iter_RHS = RHS_np - A_csc @ dy
+                new_dy, _, solver, A_upper = ldl_solve(iter_LHS, iter_RHS, p,
+                                                       solver, A_upper)
+                p.s('total_res')
+                total_res = np.linalg.norm(LHS_csc @ new_dy - RHS_np)
+                p.e('total_res')
+                if total_res > last_residual:
+                    break
+                dy = new_dy.reshape(-1, 1)
+                logger.debug(f'Preconditioned iter {total_res=}')
+                if total_res < 1e-2 or total_res > 0.9 * last_residual:
+                    break
+                last_residual = total_res
+            dt = time() - t0
+            logger.info(f'Preconditioned KKT: {dt=:.4f}, {total_res=:.4f}')
+            p.e('Precondition')
+            if self.config.check_spectral_radius:
+                p.s('Check p(inv(S)A)')
+                # Instead of checking p(inv(S)A) < 1, we can equivalently check S+A inv(S) A > 0
+                # Sigma := S + A inv(S) A, S = LDL.T
+                # Sigma = S + A inv(L.T) inv(D) inv(L) A, Let Y:= inv(L) A
+                # Sigma = S - Y.T inv(D) Y
+                # L is lower triangular, so Y is cheap, D is diagonal, so inv(D) is cheap
+                try:
+                    L_zero_diag, D_S, P_vec = solver.factors()
+                    perm = np.asarray(P_vec)
+                    L = L_zero_diag + scipy.sparse.eye(S_csc.shape[0],
+                                                       format='csc')
+                    # qdldl works in permutated space, change basis to that space.
+                    A_perm = A_csc[perm, :][:, perm].tocsc()
+                    Y = scipy.sparse.linalg.spsolve_triangular(
+                        L,
+                        A_perm.toarray(),
+                        lower=True,
+                        unit_diagonal=True,
+                    )
+                    # We are assuming S is non-singular already, just for safety
+                    inv_D_S = np.divide(1.0,
+                                        D_S,
+                                        out=np.zeros_like(D_S),
+                                        where=D_S != 0)
+
+                    # Naively check spectral radius
+                    # M  = inv(S) A = inv(L.T) inv(D) Y
+                    # L.T @ M = inv(D) @ Y
+                    inv_SA_perm = scipy.sparse.linalg.spsolve_triangular(
+                        L.T,
+                        inv_D_S[:, None] * Y,
+                        lower=False,
+                        unit_diagonal=True,
+                    )
+                    spectral_radius = (np.max(
+                        np.abs(scipy.linalg.eigvals(inv_SA_perm)))
+                                       if inv_SA_perm.size else 0.0)
+
+                    Sigma_perm = S_csc[perm, :][:, perm].toarray()
+                    Sigma_perm -= Y.T @ (inv_D_S[:, None] * Y)
+                    # Ensure symmetry, may be unnecessary
+                    Sigma_perm = 0.5 * (Sigma_perm + Sigma_perm.T)
+                    Sigma_upper = scipy.sparse.triu(
+                        scipy.sparse.csc_matrix(Sigma_perm), format='csc')
+                    Sigma_upper.eliminate_zeros()
+                    Sigma_upper.sort_indices()
+                    Sigma_upper.sum_duplicates()
+                    # pylint:disable-next=c-extension-no-member
+                    sigma_solver = qdldl.Solver(Sigma_upper, upper=True)
+                    _, D_sigma, _ = sigma_solver.factors()
+                    sigma_pos = np.sum(D_sigma > 0)
+                    sigma_neg = np.sum(D_sigma < 0)
+                    sigma_zero = len(D_sigma) - sigma_pos - sigma_neg
+                    s_pos = np.sum(D_S > 0)
+                    s_neg = np.sum(D_S < 0)
+                    s_zero = len(D_S) - s_pos - s_neg
+                    # Instead of checking p(inv(S)A) < 1, we can equivalently check S+A inv(S) A > 0
+                    logger.info('Spectral radius check: '
+                                f'rho(inv(S)A)={spectral_radius:.6g}, '
+                                'inertia: '
+                                f'Sigma={(sigma_pos, sigma_neg, sigma_zero)}, '
+                                f'S={(s_pos, s_neg, s_zero)}, ')
+                except (RuntimeError, scipy.linalg.LinAlgError) as exc:
+                    logger.info('Spectral radius check skipped: %s', exc)
+                p.e('Check p(inv(S)A)')
+        else:
+            p.s('Solve Linear (full KKT)')
+            t0 = time()
+            if self.config.ablation_level == 2:
+                # General nonsymmetric KKT: LAPACK dense LU with pivoting.
+                dense_LHS = LHS_csc.toarray()
+                dy = scipy.linalg.solve(dense_LHS, RHS_np, assume_a='gen')
+                residual = np.linalg.norm(dense_LHS @ dy - RHS_np)
+            else:
+                dy, residual, _ = solve_linear(LHS_csc,
+                                               RHS_np,
+                                               method='spsolve',
+                                               profiler=p)
+            dt = time() - t0
+            r0_norm = np.linalg.norm(RHS_np)
+            logger.info(
+                f'Full KKT :{dt=:.4f}, {r0_norm=:.4f}, {residual=:.4f}')
+            p.e('Solve Linear (full KKT)')
+
+        p.s('Line Search')
+        dx, du, dlamda, dmu = cas.vertsplit(cas.DM(dy), offsets)
+        ds = -s + (tau - s * dmu) / mu
+        # Fraction to full step, must < 1.0
+        # Step size is upper bounded by s + step_size*ds > 0.05 s, also mu
+
+        # Primal Step Size (for x, u, s)
+        # Fraction-to-boundary rule
+        raw_s = -0.995 * np.asarray(s) / np.asarray(ds)
+        max_ss_s = raw_s[raw_s > 0]
+        alpha_p = np.min(np.hstack([max_ss_s, [1.0]])).item()
+
+        # Dual Step Size (for lamda, mu)
+        raw_mu = -0.995 * np.asarray(mu) / np.asarray(dmu)
+        max_ss_mu = raw_mu[raw_mu > 0]
+        alpha_d = np.min(np.hstack([max_ss_mu, [1.0]])).item()
+
+        logger.debug('Max step: primal: %.8f, dual: %.8f, smaller one used',
+                     alpha_p, alpha_d)
+        alpha_p = alpha_d = np.min(
+            [alpha_d, alpha_p]).item()  # Use same step size for primal dual
+        step_size = 1.0
+
+        # Filter line search
+        # To simplify the linear problem, we eliminated the complementary slackness
+        # For the line search, we must restore the full residual from r
+        # r: [dL/dx, dL/du, f(x,u)-x, h(x)]
+        # full_r: [dL/dx, dL/du, f(x,u)-x, h(x)+s, \mu s-tau]
+        full_r = np.vstack([r0_val, mu * s - tau])
+        full_r[mu_offset:mu_offset + dual_h_dim] += s
+        # Perturbed complementary slackness residual
+        comp_res = np.linalg.norm(full_r[-dual_h_dim:, 0], 1).item()
+        # Infeasibility residual
+        primal_res = np.linalg.norm(full_r[nNT + mNT:-dual_h_dim, 0], 1).item()
+        # Optimality residual
+        dual_res = comp_res + np.linalg.norm(full_r[:nNT + mNT, 0], 1).item()
+        logger.debug(
+            f'step_size=0, {primal_res=:.5f}(feas), {dual_res=:.5f}(opt)')
+
+        # Initialize filter, set a large upper bound for residual
+        if len(filter_state) == 0:
+            filter_state.append((max(primal_res * 1.2, 1e4), -np.inf))
+        try:
+            for _ in range(self.config.line_search_max_iter):
+                # Evaluate primal/dual residual at trial point
+                new_x = x + step_size * alpha_p * cas.reshape(dx, n * N, T)
+                new_u = u + step_size * alpha_p * cas.reshape(du, m * N, T)
+                new_lamda = lamda + step_size * alpha_d * cas.reshape(
+                    dlamda, n * N, T)
+                new_mu = mu + step_size * alpha_d * cas.reshape(
+                    dmu, dual_h_dim, 1)
+                new_s = s + step_size * alpha_p * ds
+                new_context = self.get_full_context_casadi(new_x)
+                # logger.debug(f"Min new_mu at step {step_size}: {cas.mmin(new_mu)}")
+                r_val, h_val = self.r_casadi(new_x, new_u, new_lamda, new_mu,
+                                             new_context, int_param_dm,
+                                             double_param_dm)
+                full_r = np.vstack([r_val, new_mu * new_s - tau])
+                full_r[mu_offset:mu_offset + dual_h_dim] += new_s
+                trial_comp_res = np.linalg.norm(full_r[-dual_h_dim:, 0],
+                                                1).item()
+                # Infeasibility residual
+                trial_primal_res = np.linalg.norm(
+                    full_r[nNT + mNT:-dual_h_dim, 0], 1).item()
+                # Optimality residual
+                trial_dual_res = trial_comp_res + np.linalg.norm(
+                    full_r[:nNT + mNT, 0], 1).item()
+                logger.debug(
+                    f'{step_size=:.8f}, {trial_primal_res=:.5f}, {trial_dual_res=:.5f}'
+                )
+                improve_optimality = trial_dual_res < dual_res - self.config.bc_a * primal_res
+                improve_feasibility = trial_primal_res < (
+                    1 - self.config.bc_a) * primal_res
+                # Dominated by starting point?
+                if (not improve_optimality) and (not improve_feasibility):
+                    # logger.debug('No improvement over initial state')
+                    step_size *= self.config.bc_b
+                    continue
+
+                # Dominated by filter history?
+                is_dominated = False
+                for _primal_res, _dual_res in filter_state:
+                    _improve_optimality = trial_dual_res < _dual_res - self.config.bc_a * _primal_res
+                    _improve_feasibility = trial_primal_res < (
+                        1 - self.config.bc_a) * _primal_res
+                    if (not _improve_optimality) and (
+                            not _improve_feasibility):
+                        # logger.debug('Dominated by filter')
+                        is_dominated = True
+                        break
+                if is_dominated:
+                    step_size *= self.config.bc_b
+                    continue
+
+                # Successful line search
+                if (not improve_optimality) and improve_feasibility:
+                    # Improved feasibility at the expense of optimality.
+                    # Add to filter so we don't regress in future
+                    filter_state.append((max(1e-4, primal_res), dual_res))
+                    # logger.debug('Adding to filter')
+                raise LineSearchSuccess
+            # NOTE: future enhance What if no improvement at all? add infeasibility correction step
+            raise LineSearchMaxIter
+        except LineSearchMaxIter:
+            self.reg = np.clip(self.reg * 10, a_min=1e-5, a_max=0.1)
+            self.line_search_fail_count += 1
+            step_size = 0.0
+            new_x = x
+            new_u = u
+            new_lamda = lamda
+            new_mu = mu
+            new_s = s
+            logger.debug(
+                f"Max Iter reached, Inflating KKT regularization to {self.reg}"
+            )
+        except LineSearchSuccess:
+            logger.debug("Line search success")
+            self.reg = self.config.reg
+            self.line_search_fail_count = 0
+        p.e('Line Search')
+
+        h_val_np = np.asarray(h_val, order='F').flatten(order='F')
+        h_pos = np.linalg.norm(h_val_np[h_val_np > 0], 1)
+        logger.info(f'{primal_res=:.6f}, {dual_res=:.6f},'
+                    f'{trial_primal_res=:.6f}, {trial_dual_res=:.6f},'
+                    f'{h_pos=:.5f},'
+                    f'{self.reg=}, {step_size=:.6f}')
+
+        res = trial_primal_res + trial_dual_res
+        self.residual_vec.append(res)
+        p.e()
+
+        converged = res < self.config.tolerance
+        debug_dict = {}
+
+        return new_x, new_u, new_lamda, new_mu, new_s, res, converged, is_optimal, filter_state, debug_dict
+
+    # @deprecated
+    # def debug(self, u):
+    #     """Compare selected Python and C++ intermediate quantities for debugging."""
+    #     self.init_cpp_backend()
+    #     self.solve_cpp_backend(u)
+    #     N = self.N
+    #     T = self.T
+    #     n = self.n
+    #     m = self.m
+    #     n_h = self.n_h
+    #     gc = self.game.config
+    #     params_np = [gc.get_int_param_np(), gc.get_double_param_np()]
+    #     # return: (n*N, T)
+    #     x = self.rollout_casadi(self.game.config.x0, u, *params_np)
+    #     lamda = cas.DM.zeros((n*N, T))
+    #     mu = cas.DM.zeros((self.dual_h_dim, 1))
+    #     # new_x, new_u, _, _, res, has_converged, is_optimal, debug_dict = self.step(x, u, lamda, mu)
+
+    #     # Check each intermediate variable
+    #     context_py = self.get_full_context_casadi(x)
+    #     context_cpp = self.cpp_solver.debug_get_context()
+    #     context_cpp = np.array(context_cpp, order='F').reshape((12, 20), order='F')
+    #     context_diff = np.linalg.norm(context_py - context_py)
+    #     print(f'{context_diff=}')
+    #     # Context identical -- verified
+    #     # r0 = r(x,u, lamda, mu, context)
+    #     # r0 diff = 60
+    #     x_cpp = self.cpp_solver.debug_get_x()
+    #     u_cpp = self.cpp_solver.debug_get_u()
+    #     print(f'x_diff = {np.linalg.norm(x_cpp-x)}')
+    #     print(f'u_diff = {np.linalg.norm(u_cpp-u)}')
+    #     r0_py = debug_dict['full_r0']
+    #     res = self.cpp_solver.debug_get_full_r0()
+    #     r0_cpp = csc_matrix(
+    #         (res.data, res.row, res.colind),
+    #         shape=res.shape
+    #     )
+    #     r0_diff = np.linalg.norm(r0_py - r0_cpp)
+    #     print(f'{r0_diff=}')
+
+    #     KKT_py = debug_dict['full_KKT']
+    #     res = self.cpp_solver.debug_get_full_KKT()  # SparseMatrixResult
+    #     KKT_cpp = csc_matrix(
+    #         (res.data, res.row, res.colind),
+    #         shape=res.shape
+    #     )
+    #     KKT_diff = scipy.sparse.linalg.norm(KKT_py - KKT_cpp)
+    #     print(f'{KKT_diff=}')
+
+    #     dy_py = debug_dict['full_dy']
+    #     dy_cpp = self.cpp_solver.debug_get_full_dy()
+    #     dy_diff = np.sum(np.abs(dy_py - dy_cpp))
+    #     print(f'{dy_diff=}')
+    #     res_py = scipy.linalg.norm(KKT_py @ dy_py + r0_py)
+    #     res_cpp = scipy.linalg.norm(KKT_cpp @ dy_cpp + r0_cpp)
+    #     print(f'{res_py=}')
+    #     print(f'{res_cpp=}')
+    #     breakpoint()
+
+    def _rollout_full_x(self, u_ref, x_ref=None):
+        """ Rollout from u_ref, prepend x0 to beginning. If x_ref is provided, then just prepend x0
+        Args:
+            u_ref: (m, N, T)
+            x_ref: Optional, (n, N, T)
+        Output:
+            full_x: (n, N, T+1)
+        """
+        n = self.n
+        m = self.m
+        T = self.T
+        N = self.N
+        assert u_ref.shape == (m, N, T)
+        x0 = self.game.config.x0
+
+        # n*N, T
+        if x_ref is None:
+            u_cat = u_ref.reshape((m * N, T), order='F')
+            gc = self.game.config
+            params_np = [gc.get_int_param_np(), gc.get_double_param_np()]
+            if self.cpp_solver is None:
+                # Use rollout_casadi, pure python
+                try:
+                    x_ref = self.rollout_casadi(x0, u_cat, *params_np).full()
+                except AttributeError:
+                    logger.error(
+                        'cpp_only must be False to populate rollout_casadi()')
+                    raise
+            else:
+                # Use cpp rollout
+                x_ref = self.cpp_solver.rollout(x0, u_cat, *params_np)
+
+        full_x = np.dstack(
+            [x0[:, :, np.newaxis],
+             x_ref.reshape((n, N, T), order='F')])
+        assert full_x.shape == (n, N, T + 1)
+        return full_x
+
+    def visualize(self, u_ref, x_ref=None, save=False, show=True):
+        """ Visualize the game with given and control (u) in a single frame.
+        Args:
+            u_ref: (m, N, T, order='F')
+        """
+        u_ref = u_ref.reshape((self.m, self.N, self.T), order='F')
+        x_ref = self._rollout_full_x(u_ref, x_ref)
+        return self.game.visualize(u_ref, x_ref, show=show, save=save)
+
+    def animate(self, u_ref, x_ref=None, save_gif=False, save_snapshots=False):
+        """ Animate the game with given and control (u).
+        Args:
+            u_ref: (m, N, T, order='F')
+        """
+        u_ref = u_ref.reshape((self.m, self.N, self.T), order='F')
+        x_ref = self._rollout_full_x(u_ref, x_ref)
+        self.game.animate(u_ref,
+                          x_ref,
+                          show=True,
+                          save_gif=save_gif,
+                          save_snapshots=save_snapshots)
+
+    def final(self):
+        self.profiler.summary()
+        plt.plot(self.residual_vec, '*-')
+        plt.yscale('log')
+        plt.xlabel('Iteration')
+        plt.ylabel('Residual (exp)')
+        plt.show()
+
+    # ----- derivatives and other generic math functions ----
+    # NOTE revised for casadi
+
+    def L(self, x_k, u_k_i, x_k1_i, lamda_k, mu_i, i, context_k):
+        ''' Lagrangian for agent i at time k, excluding inequality constraints
+        Args:
+            x_k: (n, N) state vector at step k
+            u_k_i: (m, 1) control vector for agent i at step k
+            x_k1_i: (n, 1) state vector for agent i at step k+1
+            lamda_k: (n, N) Multiplier for dynamics constraint
+            mu_i: (n_h, 1),  (unused) multiplier for inequality constraint h()
+            i: agent index i
+            context_k: (n_c, N) context at step k
+        Return:
+            val: scalar value of lagrangian
+        '''
+        N = self.N
+        n = self.n
+        m = self.m
+        n_h = self.n_h
+        assert x_k.shape == (n, N)
+        assert u_k_i.shape == (m, 1)
+        assert x_k1_i.shape == (n, 1)
+        assert lamda_k.shape == (n, N)
+        assert mu_i.shape == (n_h, 1)
+
+        i_onehot = cas.SX.eye(self.N)[:, i]
+        # NOTE it may be better to store lamda_k_T to take advantage of col-major storage
+        dynamics_val = lamda_k[:, i].T @ (
+            self.game.f(x_k[:, i], u_k_i, i_onehot, context_k[:, i]) - x_k1_i)
+        val = self.game.J(x_k, u_k_i, i_onehot) + dynamics_val
+        assert val.shape == (1, 1)
+        return val
+
+    def LLi(self, x, u, lamda, mu, i, hi_vals, context):
+        ''' Lagrangian for agent i across all time steps
+        Args:
+            x: (n*N, T) Agent states
+            u: (m*N, T) Agent control
+            lamda: (n*N, T) Multiplier for dynamics constraint
+            mu: (dual_h_dim, 1) Multiplier for positive h
+            i: agent index
+            hi_vals: (n_h, 1) h() values for agent i
+            context: (n_c*N, T) context variable of game
+        Return:
+            val: scalar value of Lagrangian
+        '''
+        T = self.T
+        N = self.N
+        m = self.m
+        n = self.n
+        n_h = self.n_h
+        n_c = self.n_c
+        LLi_val = sum([
+            self.L(
+                cas.reshape(x[:, k - 1], n, N),
+                cas.reshape(u[:, k], m, N)[:, i],
+                cas.reshape(x[:, k], n, N)[:,
+                                           i], cas.reshape(lamda[:, k], n, N),
+                cas.reshape(
+                    mu, n_h,
+                    self.h_multiplier_cols)[:,
+                                            0 if self.variational_gne else i],
+                i, cas.reshape(context[:, k], n_c, N)) for k in range(1, T)
+        ])
+
+        # feasibility for h>0
+        # NOTE add fmax here for safety,
+        # we only want to sum h_val > 0
+        mu_i = cas.reshape(
+            mu, n_h, self.h_multiplier_cols)[:,
+                                             0 if self.variational_gne else i]
+        LLi_val += cas.dot(mu_i, hi_vals)
+
+        x0 = self.game.config.get_param('x0')
+        # x0 related terms
+        lamda_0_i = cas.reshape(lamda[:, 0], n, N)[:, i]  # k=0
+        i_onehot = cas.SX.eye(self.N)[:, i]
+        u0_i = cas.reshape(u[:, 0], m, N)[:, i]
+        context_i_0 = cas.reshape(context[:, 0], n_c, N)[:, i]
+        LLi_val += (self.game.J(x0, u0_i, i_onehot) + cas.dot(
+            lamda_0_i,
+            self.game.f(x0[:, i], u0_i, i_onehot, context_i_0) -
+            cas.reshape(x[:, 0], n, N)[:, i]))
+        # x_T related terms
+        x_T = cas.reshape(x[:, T - 1], n, N)
+        LLi_val += self.game.Jfi(x_T, i_onehot)
+
+        assert LLi_val.shape == (1, 1)
+        return LLi_val
+
+    def r(self, x, u, lamda, mu, context):
+        ''' Residual for the game
+        Args:
+            x: (n*N, T) Agent states
+            u: (m*N, T) Agent control
+            lamda: (n*N, T) Multiplier for dynamics constraint
+            mu: (dual_h_dim, 1) Multiplier for positive h
+            context: (n_c*N, T) Game context, changes between iteration, but constant within iteration.
+                This contains variables too expensive to AD.
+                e.g. path curvature at each player position.
+        Return:
+            r_val: (nNT+mNT+nNT+dual_h_dim, 1) column vector of residual r
+            h_val:
+                variational mode: (n_h, 1)
+                non-variational mode: (n_h, N)
+        '''
+        T = self.T
+        N = self.N
+        n = self.n
+        m = self.m
+        n_h = self.n_h
+        n_c = self.n_c
+        # elements are column vectors
+        r_vec = []
+        eye = cas.SX.eye(self.N)
+        h_val = self.game.h(x, u, context)
+
+        # dLLi_dx for all i, n*N*N*T
+        # for LL_idx in range(N):  # dLL[i]
+        #     # dLLi_dx{-i} is a part of the residual, so two agent indices
+        #     hi_val = h_val[:, LL_idx]
+        #     # dLLi_dx n*N*T
+        #     for k in range(T):
+        #         for i in range(N):  # dLLi_dx[k][i]
+        #             xki = cas.reshape(x[:, k], n, N)[:, i]
+        #             dLLi_dxki = cas.jacobian(self.LLi(x, u, lamda, mu, LL_idx, hi_val), xki).T
+        #             r_vec.append(dLLi_dxki)  # n
+        #             assert dLLi_dxki.shape == (n, 1)
+
+        x_vec = cas.vec(x)
+        u_vec = cas.vec(u)
+
+        # dLLi_dx n*N*T
+        dLLi_dx_vec = []
+        dLLi_du_vec = []
+        for i in range(N):
+            hi_val = h_val[:, 0 if self.variational_gne else i]
+            lagrangian_i = self.LLi(x, u, lamda, mu, i, hi_val, context)
+            dLLi_dx_vec.append(cas.jacobian(lagrangian_i, x_vec).T)
+            dLLi_du_vec.append(cas.jacobian(lagrangian_i, u_vec).T)
+
+        for k in range(T):
+            xk_offset = k * n * N
+            for i in range(N):  # dLLi_dx[k][i]
+                dLLi_dxki = dLLi_dx_vec[i][xk_offset + i * n:xk_offset +
+                                           (i + 1) * n]
+                r_vec.append(dLLi_dxki)  # n
+                assert dLLi_dxki.shape == (n, 1)
+
+        # dLLi_dui for all i, m*N*T
+        # Unlike dLLi_dx, dLL[i]_du[i] only applies to the same index set, dLLi_du{-i} != 0
+        for k in range(T):
+            uk_offset = k * m * N
+            for i in range(N):
+                dLLi_duki = dLLi_du_vec[i][uk_offset + i * m:uk_offset +
+                                           (i + 1) * m]
+                r_vec.append(dLLi_duki)  # m
+                assert dLLi_duki.shape == (m, 1)
+
+        # Dynamics residual for f(x0,u0) - x1  (n*N)
+        for i in range(N):
+            i_onehot = eye[:, i]
+            x0 = self.game.config.get_param('x0')
+            u0 = cas.reshape(u[:, 0], m, N)
+            context_i_0 = cas.reshape(context[:, 0], n_c, N)
+            f0 = self.game.f(x0[:, i], u0[:, i], i_onehot, context_i_0[:, i]) - \
+                cas.reshape(x[:, 0], n, N)[:, i]
+            assert f0.shape == (n, 1)
+            r_vec.append(f0)  # n
+
+        # Dynamics residual for f(xk,uk) - x_{k+1}  (n*N*(T-1))
+        for k in range(1, self.T):
+            context_i_k = cas.reshape(context[:, k], n_c, N)
+            for i in range(N):
+                i_onehot = eye[:, i]
+                xk = cas.reshape(x[:, k - 1], n, N)
+                xk1 = cas.reshape(x[:, k], n, N)
+                uk = cas.reshape(u[:, k], m, N)
+                fk = self.game.f(xk[:, i], uk[:, i], i_onehot,
+                                 context_i_k[:, i]) - xk1[:, i]
+                assert fk.shape == (n, 1)
+                r_vec.append(fk)  # n
+
+        r_vec.append(cas.vec(h_val))  # dual_h_dim
+        r_val = cas.vertcat(*r_vec)
+        assert r_val.shape == (n * N * T + m * N * T + n * N * T +
+                               self.dual_h_dim, 1)
+        expected_h_cols = 1 if self.variational_gne else N
+        assert h_val.shape == (n_h, expected_h_cols)
+        return r_val, h_val
+
+    def check_Ki(self, Ki):
+        """ Verify agent KKT matrix is in following format, return component H, A
+        [H A.T
+         A 0 ]
+        Args:
+            Ki: scipy.sparse.csc_matrix
+        Returns:
+            H, A
+        """
+        tol = 1e-2
+        T = self.T
+        n = self.n
+        m = self.m
+        primal_n = (n + m) * T  # primal variables for agent i
+        H = Ki[:primal_n, :primal_n]
+        A = Ki[primal_n:, :primal_n]
+        AT = Ki[:primal_n, primal_n:]
+
+        empty = Ki[primal_n:, primal_n:]
+        assert scipy.sparse.linalg.norm(empty) < tol
+        assert empty.nnz == 0
+
+        assert np.sum(np.abs((H - H.T).data)) < tol
+        dyn_diff = (A - AT.T).toarray()[:n * T, :]
+        assert np.sum(np.abs(dyn_diff)) < tol
+
+        h_diff = (A - AT.T).toarray()[n * T:, :]
+        assert np.sum(np.abs(h_diff)) < tol
+
+        return H, A
+
+    def check_KKT(self, Ki):
+        """ Verify KKT matrix is in following format, return component H, A
+        [H A.T
+         A 0 ]
+        Args:
+            Ki: scipy.sparse.csc_matrix
+        Returns:
+            H, A
+        NOTE does not apply to current formulation
+        """
+        T = self.T
+        N = self.N
+        n = self.n
+        m = self.m
+        primal_n = (n + m) * N * T  # primal variables for the game
+        H = Ki[:primal_n, :primal_n]
+        A = Ki[primal_n:, :primal_n]
+        AT = Ki[:primal_n, primal_n:]
+
+        empty = Ki[primal_n:, primal_n:]
+        assert scipy.sparse.linalg.norm(empty) < 1e-10
+        assert empty.nnz == 0
+
+        assert np.sum(np.abs((H - H.T).data)) < 1e-10
+        dyn_diff = (A - AT.T).toarray()[:n * N * T, :]
+        assert np.sum(np.abs(dyn_diff)) < 1e-10
+
+        # won't pass by construction
+        # e.g. dLLi/dxi does not depend on mu_j, but mu_j * h(xj,xi) depends on xi
+        # h_diff = (A-AT.T).toarray()[n*N*T:, :]
+        # assert np.sum(np.abs(h_diff)) < 1e-10
+
+        # assert np.sum(np.abs((A-AT.T).data)) < 1e-10
+        return H, A
+
+    def apply_abs_split_to_game_kkt(self, full_KKT):
+        """Apply the |S|+A transform to the primal Hessian block of the full KKT."""
+        primal_var_count = (self.n + self.m) * self.N * self.T
+        H = full_KKT[:primal_var_count, :primal_var_count].tocsc()
+        H_t = H.T.tocsc()
+        S = ((H + H_t) * 0.5).tocsc()
+        A = ((H - H_t) * 0.5).tocsc()
+        S_upper = scipy.sparse.triu(S, format='csc')
+        S_upper.eliminate_zeros()
+        S_upper.sort_indices()
+        S_upper.sum_duplicates()
+        eye = scipy.sparse.eye(primal_var_count, format='csc')
+        factorized = None
+        last_exc = None
+        for shift in [0.0, 1e-12, 1e-10, 1e-8, 1e-6]:
+            shifted_upper = S_upper if shift == 0.0 else (S_upper +
+                                                          shift * eye).tocsc()
+            shifted_upper.eliminate_zeros()
+            shifted_upper.sort_indices()
+            shifted_upper.sum_duplicates()
+            try:
+                # pylint:disable-next=c-extension-no-member
+                solver = qdldl.Solver(shifted_upper, upper=True)
+                factorized = (shift, *solver.factors())
+                break
+            except RuntimeError as exc:
+                last_exc = exc
+        if factorized is None:
+            logger.warning(
+                'abs_split skipped because qdldl failed on the primal Hessian block: %s',
+                last_exc,
+            )
+            return full_KKT
+
+        shift, L_zero_diag, D_diag, P_vec = factorized
+        if shift == 0.0 and np.all(D_diag > 0):
+            return full_KKT
+
+        S_abs = reconstruct_qdldl_matrix(L_zero_diag, np.abs(D_diag), P_vec)
+        H_abs = (S_abs + A).tocsc()
+        H_abs.eliminate_zeros()
+        H_abs.sort_indices()
+        H_abs.sum_duplicates()
+        top = scipy.sparse.hstack(
+            [H_abs, full_KKT[:primal_var_count, primal_var_count:]],
+            format='csc')
+        bottom = scipy.sparse.hstack([
+            full_KKT[primal_var_count:, :primal_var_count],
+            full_KKT[primal_var_count:, primal_var_count:]
+        ],
+                                     format='csc')
+        return scipy.sparse.vstack([top, bottom], format='csc')
+
+    def residual_components(self, r):
+        """ Check the residual for each subcomponents
+        Args:
+            r: (dim, 1) residual vector, CasADi DM matrix
+        Returns:
+            each component in r
+        """
+        r = r.toarray()
+        T = self.T
+        N = self.N
+        n = self.n
+        dual_h_dim = self.dual_h_dim
+        m = self.m
+        offset = 0
+        r_Lx = norm(r[n * N * T, 0])
+        offset += n * N * T
+        r_Lu = norm(r[offset:offset + m * N * T])
+        offset += m * N * T
+        r_f = norm(r[offset:offset + n * N * T])
+        offset += n * N * T
+        r_h = norm(r[offset:offset + dual_h_dim])
+        offset += dual_h_dim
+        assert r.shape == (offset, 1)
+        return r_Lx, r_Lu, r_f, r_h
+
+    def dr_to_dri(self, dr):
+        """ Slice dr to a vector of dri. Also applies to dy -> dyi
+        Args:
+            dr: (dim) column vector
+        Returns:
+            dri_vec: list[ (dim)]"""
+        N = self.N
+        T = self.T
+        n = self.n
+        m = self.m
+        if self.variational_gne:
+            raise NotImplementedError(
+                'dr_to_dri is only defined for per-agent inequality multipliers'
+            )
+        n_h = self.n_h
+        dri_vec = []
+        xi_size = n * T
+        ui_size = m * T
+        li_size = n * T
+        mi_size = n_h
+        dri_vec = []
+        dri_size = n * T + m * T + n * T + n_h
+        for i in range(N):
+            dri = np.zeros(dri_size) + np.nan
+            offset = 0
+            offset_i = 0
+            # x
+            dri[:xi_size] = dr[i * xi_size:(i + 1) * xi_size]
+            offset += xi_size * N
+            offset_i += xi_size
+            # u
+            dri[offset_i:offset_i + ui_size] = dr[offset + i * ui_size:offset +
+                                                  (i + 1) * ui_size]
+            offset += ui_size * N
+            offset_i += ui_size
+            # lamda
+            dri[offset_i:offset_i + li_size] = dr[offset + i * li_size:offset +
+                                                  (i + 1) * li_size]
+            offset += li_size * N
+            offset_i += li_size
+            # mu
+            dri[offset_i:offset_i + mi_size] = dr[offset + i * mi_size:offset +
+                                                  (i + 1) * mi_size]
+            offset += mi_size * N
+            offset_i += mi_size
+            assert offset == dr.shape[0]
+            assert offset_i == dri.shape[0]
+            assert not np.any(np.isnan(dri))
+            dri_vec.append(dri)
+        return dri_vec
+
+    def dri_to_dr(self, dri_vec):
+        """ Construct dr from dri, also works on dy -> dy_i
+        Args:
+            dr: (dim) column vector
+        Returns:
+            dri_vec: list[ (dim)]"""
+        N = self.N
+        T = self.T
+        n = self.n
+        m = self.m
+        if self.variational_gne:
+            raise NotImplementedError(
+                'dri_to_dr is only defined for per-agent inequality multipliers'
+            )
+        n_h = self.n_h
+        dr_size = n * N * T + m * N * T + n * N * T + n_h * N
+        dr = np.zeros(dr_size) + np.nan
+        for i in range(N):
+            dri = dri_vec[i]
+            offset = 0
+            offset_i = 0
+            # x
+            xi_size = n * T
+            dr[i * xi_size:(i + 1) * xi_size] = dri[:xi_size]
+            offset += xi_size * N
+            offset_i += xi_size
+            # u
+            ui_size = m * T
+            dr[offset + i * ui_size:offset +
+               (i + 1) * ui_size] = dri[offset_i:offset_i + ui_size]
+            offset += ui_size * N
+            offset_i += ui_size
+            # lamda
+            li_size = n * T
+            dr[offset + i * li_size:offset +
+               (i + 1) * li_size] = dri[offset_i:offset_i + li_size]
+            offset += li_size * N
+            offset_i += li_size
+            # mu
+            mi_size = n_h
+            dr[offset + i * mi_size:offset +
+               (i + 1) * mi_size] = dri[offset_i:offset_i + mi_size]
+            offset += mi_size * N
+            offset_i += mi_size
+            assert offset == dr_size
+            assert offset_i == dri.shape[0]
+        assert not np.any(np.isnan(dr))
+        return dr
+
+    def r_idx_str(self, idx):
+        """ Given an r index, print its name"""
+        N = self.N
+        n = self.n
+        m = self.m
+        T = self.T
+        dual_h_dim = self.dual_h_dim
+        if idx < n * N * T:
+            Ti = idx // (n * N)
+            Ni = (idx - Ti * n * N) // n
+            ni = idx - Ti * n * N - Ni * n
+            return f'dLLi/dxi {Ti=}, {Ni=}, {ni=}'
+        idx -= n * N * T
+
+        if idx < m * N * T:
+            Ti = idx // (m * N)
+            Ni = (idx - Ti * m * N) // m
+            mi = idx - Ti * m * N - Ni * m
+            return f'dLLi/dui {Ti=}, {Ni=}, {mi=}'
+        idx -= m * N * T
+
+        if idx < n * N * T:
+            Ti = idx // (n * N)
+            Ni = (idx - Ti * n * N) // n
+            ni = idx - Ti * n * N - Ni * n
+            return f'f(x,u) {Ti=}, {Ni=}, {ni=}'
+        idx -= n * N * T
+
+        if idx < dual_h_dim:
+            if self.variational_gne:
+                return f'h(x,u) shared idx={idx}'
+            Ni = idx // self.n_h
+            local_idx = idx - self.n_h * Ni
+            return f'h(x,u) constraint={local_idx}, owner={Ni}'
+
+    def y_idx_str(self, idx):
+        """ Given an y index, print its name"""
+        N = self.N
+        n = self.n
+        m = self.m
+        T = self.T
+        dual_h_dim = self.dual_h_dim
+        if idx < n * N * T:
+            Ti = idx // (n * N)
+            Ni = (idx - Ti * n * N) // n
+            ni = idx - Ti * n * N - Ni * n
+            return f'x {Ti=}, {Ni=}, {ni=}'
+        idx -= n * N * T
+
+        if idx < m * N * T:
+            Ti = idx // (m * N)
+            Ni = (idx - Ti * m * N) // m
+            mi = idx - Ti * m * N - Ni * m
+            return f'u {Ti=}, {Ni=}, {mi=}'
+        idx -= m * N * T
+
+        if idx < n * N * T:
+            Ti = idx // (n * N)
+            Ni = (idx - Ti * n * N) // n
+            ni = idx - Ti * n * N - Ni * n
+            return f'lambda for f(x,u) {idx=}, {Ti=}, {Ni=}, {ni=}'
+        idx -= n * N * T
+
+        if idx < dual_h_dim:
+            if self.variational_gne:
+                return f'mu for shared h(x,u) {idx=}'
+            Ni = idx // self.n_h
+            local_idx = idx - self.n_h * Ni
+            return f'mu for h(x,u) {idx=} constraint={local_idx}, owner={Ni}'
+
+    def make_full_KKT_reg(self, reg_vec):
+        """ Given a list of regularization value for each agent,
+        create a regularizaiton matrix for full game KKT"""
+        N = self.N
+        n = self.n
+        m = self.m
+        T = self.T
+        l = n * N * T + m * N * T + n * N * T + self.dual_h_dim
+        data = []
+        row = []
+        for i in range(self.N):
+            for k in range(self.T):
+                for idx in range(self.n):
+                    data.append(reg_vec[i])
+                    row.append(k * (n * N) + i * n + idx)
+                for idx in range(self.m):
+                    data.append(reg_vec[i])
+                    row.append(n * N * T + k * (m * N) + i * m + idx)
+        reg_mtx = csc_matrix((data, (row, row)), shape=(l, l))
+        return reg_mtx
+
+    def reduce_ki_to_active_constraints(self, Ki, ri, h_i_val):
+        """Remove inactive h rows and the associated mu columns from a player KKT.
+
+        K_i uses the same ordering for residual rows and primal/dual variables,
+        so the same active index set is applied to both axes.
+        """
+        primal_var_count = (self.n + self.m) * self.T
+        dynamics_constraint_count = self.n * self.T
+        h_row_offset = primal_var_count + dynamics_constraint_count
+
+        active_h_indices = np.flatnonzero(
+            np.asarray(h_i_val).reshape(-1) >= 0.0)
+        active_ki_indices = np.concatenate(
+            [np.arange(h_row_offset), h_row_offset + active_h_indices])
+
+        reduced_Ki = Ki[active_ki_indices, :][:, active_ki_indices].tocsc()
+        reduced_ri = np.asarray(ri).reshape(-1, 1)[active_ki_indices, :]
+        return reduced_Ki, reduced_ri, active_ki_indices
+
+    def get_inertia(self, mtx):
+        """ Given matrix mtx, give inertia (pos,neg,zero), and qdldl solver instance"""
+        upper = scipy.sparse.triu(mtx, format='csc')
+        upper.eliminate_zeros()
+        upper.sort_indices()
+        upper.sum_duplicates()
+        # pylint:disable-next=c-extension-no-member
+        solver = qdldl.Solver(upper, upper=True)
+
+        #  C = P @ A @ P.T, C = L @ D @ L.T
+        # L_zero_diag, D_diag, P_vec = solver.factors()
+        _, D_diag, _ = solver.factors()
+        pos = np.sum(D_diag > 0)
+        neg = np.sum(D_diag < 0)
+        zero = len(D_diag) - pos - neg
+        inertia = (pos, neg, zero)
+        return inertia, solver

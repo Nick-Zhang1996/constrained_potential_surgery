@@ -1,0 +1,1481 @@
+// Interior-point game solver compatible with CasADi codegen.
+#pragma once
+
+#include <dlfcn.h>
+#include <limits.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <cmath>
+#include <filesystem>  // c++ 17
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+#define SPDLOG_HEADER_ONLY
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <spdlog/fmt/ostr.h>
+#include <spdlog/fmt/ranges.h>  // <--- Critical for printing containers
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
+// #define EIGEN_RUNTIME_NO_MALLOC
+// Eigen::internal::set_is_malloc_allowed(false);
+#include <Eigen/Core>
+#include <Eigen/LU>
+#include <Eigen/SparseCholesky>
+#include <Eigen/SparseCore>
+#include <Eigen/SparseLU>
+#include <Eigen/SuperLUSupport>
+#include <Eigen/UmfPackSupport>
+
+// sparse solvers
+#include <Eigen/OrderingMethods>
+#include <Eigen/SparseQR>
+// for LeastSquaresConjugateGradient
+#include <Eigen/IterativeLinearSolvers>
+#include <casadi/casadi.hpp>
+
+namespace py = pybind11;
+namespace cas = casadi;
+
+#include "profiler.h"
+
+using Scalar = double;
+using Eigen::MatrixXd;
+using std::cout;
+using std::endl;
+using std::max;
+using std::min;
+// SpMatrix was taken
+using Vector = Eigen::VectorXd;
+using SpMatrix = Eigen::SparseMatrix<double, Eigen::ColMajor, casadi_int>;
+using UmfSpMatrix = Eigen::SparseMatrix<double, Eigen::ColMajor, SuiteSparse_long>;
+using MappedSparseMatrix = Eigen::Map<SpMatrix>;
+
+namespace fs = std::filesystem;
+
+// Work buffer for casadi functions
+struct FuncWorkBuffer {
+  std::vector<const double*> args;
+  std::vector<double*> res;
+  std::vector<casadi_int> iw;
+  std::vector<double> w;
+};
+
+// Compressed Colume Storage matrix, for passing to Python
+struct SparseMatrixResult {
+  std::pair<int, int> shape;  // (rows, cols)
+  std::vector<casadi_int> row;
+  std::vector<casadi_int> colind;
+  std::vector<double> data;
+};
+
+// Given a vector of CasADi functions, allocate sufficiently sized work buffers
+// NOTE [args] and [res] are vector of pointers, this fun only allocate the
+// pointers, not the actual content
+FuncWorkBuffer get_max_buffer(std::vector<cas::Function> fun_vec) {
+  size_t sz_arg = 0, sz_res = 0, sz_iw = 0, sz_w = 0;
+  for (const auto& fun : fun_vec) {
+    size_t sz_arg_, sz_res_, sz_iw_, sz_w_;
+    fun.sz_work(sz_arg_, sz_res_, sz_iw_, sz_w_);
+    sz_arg = sz_arg > sz_arg_ ? sz_arg : sz_arg_;
+    sz_res = sz_res > sz_res_ ? sz_res : sz_res_;
+    sz_iw = sz_iw > sz_iw_ ? sz_iw : sz_iw_;
+    sz_w = sz_w > sz_w_ ? sz_w : sz_w_;
+  }
+  std::vector<const double*> args(sz_arg);
+  std::vector<double*> res(sz_res);
+  std::vector<casadi_int> iw(sz_iw);
+  std::vector<double> w(sz_w);
+  return {args, res, iw, w};
+}
+
+cas::Function safe_load_fun(std::string fun_name, fs::path lib_path) {
+  cas::Function fun = cas::external(fun_name, lib_path.string());
+
+  if (fun.is_null()) {
+    throw std::runtime_error("Failed to load " + fun_name + " from " + lib_path.string());
+  }
+  return fun;
+}
+
+// Create MappedSparseMatrix sparsity pattern and data
+inline MappedSparseMatrix get_mapped_spmatrix(casadi::Sparsity sp, double* data) {
+  MappedSparseMatrix retval(sp.size1(), sp.size2(), sp.nnz(), const_cast<casadi_int*>(sp.colind()),
+                            const_cast<casadi_int*>(sp.row()), data);
+  return retval;
+}
+
+class InteriorPointGame {
+ protected:
+  int n_, m_, N_, T_, n_hi_, h_multiplier_cols_, dual_h_dim_;
+  Scalar dt_, bc_a_, bc_b_, reg0_, reg_;
+  Scalar reg_inertia_;
+  Scalar tolerance_;
+  Scalar tau_decay_;
+  int line_search_max_iter_;
+  int max_failed_line_search_;
+  int max_iterations_;
+  int max_in_reg_iter_;
+  Scalar max_in_reg_val_;
+  // dim: N*n
+  MatrixXd x0_;
+  mutable Profiler<false> profiler_;
+  int verbose_;  // 0:error, 1:warning, 2:info, 3:debug
+  const bool inertia_correction_;
+  const Scalar inertia_correction_base_;
+  const bool inertia_correction_classic_;
+  const Scalar inertia_correction_classic_start_;
+  const Scalar inertia_correction_classic_scale_;
+  const bool keep_only_active_constraints_in_ki_;
+  const bool abs_split_;
+  const bool rollout_each_step_;
+  const bool precondition_with_potential_;
+  const int ablation_level_;
+  const bool variational_gne_;
+  const std::string linear_solver_method_;
+  int line_search_fail_count_;
+  std::vector<Scalar> residual_history_;
+
+  std::shared_ptr<spdlog::logger> logger_;
+
+  // CasADi work buffer
+  FuncWorkBuffer wb_;
+
+  cas::Function r_;
+  cas::Function dr_dy_;
+  cas::Function rollout_;
+  cas::Function h_;
+  cas::Function collision_h_;
+  cas::Function get_full_context_;
+  std::vector<cas::Function> Ki_vec_;
+  // std::vector<cas::Function> ri_vec_;
+
+  bool debug_got_vals_;  // We only need the first vals
+  SpMatrix debug_full_KKT_;
+  SpMatrix debug_full_r0_;
+  std::vector<double> debug_context;
+  MatrixXd debug_full_dy;
+  MatrixXd debug_x;
+  MatrixXd debug_u;
+
+ public:
+  // NOTE n,m may need to be template variables for performance
+  InteriorPointGame(const int N, const int T, const int n_hi, const Scalar dt, const Scalar bc_a,
+                    const Scalar bc_b, const Scalar reg, const Scalar reg_inertia,
+                    const bool inertia_correction, const Scalar inertia_correction_base,
+                    const bool inertia_correction_classic,
+                    const Scalar inertia_correction_classic_start,
+                    const Scalar inertia_correction_classic_scale,
+                    const bool keep_only_active_constraints_in_ki, const bool abs_split,
+                    const bool rollout_each_step, const bool precondition_with_potential,
+                    const int ablation_level, const bool variational_gne,
+                    const Scalar tolerance, const Scalar tau_decay,
+                    const int line_search_max_iter, const int max_failed_line_search,
+                    const int max_iter, const int max_in_reg_iter, const Scalar max_in_reg_val,
+                    const std::string linear_solver_method, const int verbose,
+                    const std::string base_dir, const std::string casadi_module_name)
+      : N_{N},
+        T_{T},
+        n_hi_{n_hi},
+        h_multiplier_cols_{variational_gne ? 1 : N},
+        dual_h_dim_{n_hi * (variational_gne ? 1 : N)},
+        dt_{dt},
+        bc_a_{bc_a},
+        bc_b_{bc_b},
+        reg0_{reg},
+        reg_{reg},
+        reg_inertia_{reg_inertia},
+        inertia_correction_{inertia_correction},
+        inertia_correction_base_{inertia_correction_base},
+        inertia_correction_classic_{inertia_correction_classic},
+        inertia_correction_classic_start_{inertia_correction_classic_start},
+        inertia_correction_classic_scale_{inertia_correction_classic_scale},
+        keep_only_active_constraints_in_ki_{keep_only_active_constraints_in_ki},
+        abs_split_{abs_split},
+        rollout_each_step_{rollout_each_step},
+        precondition_with_potential_{precondition_with_potential},
+        ablation_level_{ablation_level},
+        variational_gne_{variational_gne},
+        tolerance_{tolerance},
+        tau_decay_{tau_decay},
+        line_search_max_iter_{line_search_max_iter},
+        max_failed_line_search_{max_failed_line_search},
+        x0_{},
+        profiler_{},
+        max_iterations_{max_iter},
+        max_in_reg_iter_{max_in_reg_iter},
+        max_in_reg_val_{max_in_reg_val},
+        linear_solver_method_{linear_solver_method},
+        verbose_{verbose},
+        line_search_fail_count_{0},
+        debug_got_vals_{false} {
+    if (inertia_correction_ && inertia_correction_classic_) {
+      throw std::invalid_argument(
+          "inertia_correction and inertia_correction_classic are mutually exclusive");
+    }
+    assert(ablation_level_ >= 0 && ablation_level_ <= 2);
+    assert((ablation_level_ == 0 || precondition_with_potential_) &&
+           "PDO ablations require precondition_with_potential=True");
+    assert((ablation_level_ == 0 || variational_gne_) &&
+           "PDO ablation levels 1 and 2 require vGNE");
+
+    const std::string logger_name{"interior_point_game_cpp"};
+    logger_ = spdlog::get(logger_name);
+    if (!logger_) {
+      logger_ = spdlog::stdout_color_mt(logger_name);
+    }
+
+    // 0:error, 1:warning, 2:info, 3:debug
+    switch (verbose_) {
+      case 0:
+        spdlog::set_level(spdlog::level::err);
+        break;
+      case 1:
+        spdlog::set_level(spdlog::level::warn);
+        break;
+      case 2:
+        spdlog::set_level(spdlog::level::info);
+        break;
+      case 3:
+        spdlog::set_level(spdlog::level::debug);
+        break;
+    }
+    // Set custom format: [Time] [Logger] [Level] Message
+    spdlog::set_pattern("[%H:%M:%S.%e] [%n] [%^%l%$] %v");
+
+    // Load CasADi dll for given game following naming convention,
+    // game (module name), N, T -> this determines a unique dll name.
+    std::stringstream ss;
+    ss << "lib" << casadi_module_name << "_ipm";
+    if (variational_gne_) {
+      ss << "_vne";
+    }
+    ss << "_N" << N << "_T" << T << ".so";
+    fs::path lib_path = fs::path(base_dir) / "build" / "lib" / ss.str();
+
+    r_ = safe_load_fun("r", lib_path);
+    dr_dy_ = safe_load_fun("dr_dy", lib_path);
+    rollout_ = safe_load_fun("rollout", lib_path);
+    h_ = safe_load_fun("h", lib_path);
+    collision_h_ = safe_load_fun("collision_h", lib_path);
+    get_full_context_ = safe_load_fun("get_full_context", lib_path);
+
+    cas::Function get_n = safe_load_fun("get_n", lib_path);
+    cas::Function get_m = safe_load_fun("get_m", lib_path);
+
+    Ki_vec_.reserve(N_);
+    // ri_vec_.reserve(N_);
+    for (int i = 0; i < N_; i++) {
+      Ki_vec_.push_back(safe_load_fun("K_" + std::to_string(i), lib_path));
+      // ri_vec_.push_back(safe_load_fun("r_"+std::to_string(i), lib_path));
+    }
+
+    wb_ = get_max_buffer({r_, dr_dy_, rollout_, h_, collision_h_, get_full_context_, get_n, get_m});
+
+    std::vector<double> n_buffer(get_n.sparsity_out(0).nnz());
+    wb_.res[0] = n_buffer.data();
+    get_n(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+    assert(get_n.n_out() == 1);
+    n_ = n_buffer[0];
+
+    std::vector<double> m_buffer(get_m.sparsity_out(0).nnz());
+    wb_.res[0] = m_buffer.data();
+    get_m(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+    assert(get_m.n_out() == 1);
+    m_ = m_buffer[0];
+
+    logger_->debug("RD3G CasADi initialized, n={}, m={}, dual_h_dim={}, variational_gne={}", n_, m_,
+                   dual_h_dim_, variational_gne_);
+  }
+
+  void set_x0(const MatrixXd& val) { x0_ = MatrixXd(val); }
+
+  // Evaluate dr_dy function from casadi using python arguments.
+  // Demonstrating data representation conversion and call procedure
+  SparseMatrixResult casadi_dr_dy(py::array_t<double> x, py::array_t<double> u,
+                                  py::array_t<double> lamda, py::array_t<double> mu,
+                                  py::array_t<double> context, py::array_t<double> int_param,
+                                  py::array_t<double> double_param) {
+    // Set input args
+    auto x_val = x.request();  // py::buffer_info
+    auto u_val = u.request();
+    auto lamda_val = lamda.request();
+    auto mu_val = mu.request();
+    auto context_val = context.request();
+    auto int_param_val = int_param.request();
+    auto double_param_val = double_param.request();
+
+    wb_.args[0] = static_cast<double*>(x_val.ptr);
+    wb_.args[1] = static_cast<double*>(u_val.ptr);
+    wb_.args[2] = static_cast<double*>(lamda_val.ptr);
+    wb_.args[3] = static_cast<double*>(mu_val.ptr);
+    wb_.args[4] = static_cast<double*>(context_val.ptr);
+    wb_.args[5] = static_cast<double*>(int_param_val.ptr);
+    wb_.args[6] = static_cast<double*>(double_param_val.ptr);
+    assert(dr_dy_.n_in() == 7);
+
+    const casadi::Sparsity& res_sp = dr_dy_.sparsity_out(0);  // 0th output sparsity
+    // Allocate output buffer
+    std::vector<double> res_buffer(res_sp.nnz());
+    wb_.res[0] = res_buffer.data();
+    assert(dr_dy_.n_out() == 1);
+
+    // Call work function
+    dr_dy_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+
+    SparseMatrixResult res;
+    res.shape = res_sp.size();
+    res.data = res_buffer;
+    res.row.assign(res_sp.row(), res_sp.row() + res_sp.nnz());
+    res.colind.assign(res_sp.colind(), res_sp.colind() + res_sp.size2() + 1);
+    return res;
+  }
+
+  // Given [h_val],
+  // remove rows corresponding to h<0 (inactive constraints) full_r0
+  // Remove rows for h<0, and cols for corresponding mu (multiplier) from
+  // full_KKT. Returns:
+  //      reduced_KKT:
+  //      reduced_r0:
+  //      active_h_indices:
+  std::tuple<SpMatrix, MatrixXd, std::vector<int>> reduce_KKT_system(const SpMatrix& full_KKT,
+                                                                     const SpMatrix& full_r0,
+                                                                     const MatrixXd& h_val) {
+    // Starting index of first h() in residual
+    // Skipping through dLLi_dx, dLLi_du, dynamics constraint
+    // Also starting index of mu, multiplier for h(), in y
+    const int h_in_r_offset = n_ * N_ * T_ + m_ * N_ * T_ + n_ * N_ * T_;
+    assert(h_val.rows() * h_val.cols() == dual_h_dim_);
+
+    // Maps rows in full_r0 to reduced_r0, -1 means delete
+    std::vector<int> old_to_new_idx(full_r0.rows(), -1);
+    std::vector<int> active_h_indices;
+    active_h_indices.reserve(dual_h_dim_);
+    int reduced_r_dim = 0;
+
+    // Always keep dL/dx, dL/du, dynamics constraints
+    for (int i = 0; i < h_in_r_offset; i++) {
+      old_to_new_idx[i] = reduced_r_dim++;
+    }
+
+    assert(h_val.rows() == full_r0.rows() - h_in_r_offset);
+    for (int i = h_in_r_offset; i < full_r0.rows(); i++) {
+      if (h_val(i - h_in_r_offset, 0) >= 0.0) {
+        old_to_new_idx[i] = reduced_r_dim++;
+        active_h_indices.push_back(i - h_in_r_offset);
+      }
+    }
+
+    // Construct reduced_r0
+    MatrixXd reduced_r0(reduced_r_dim, 1);
+
+    for (int i = 0; i < full_r0.rows(); i++) {
+      if (old_to_new_idx[i] != -1) {
+        reduced_r0(old_to_new_idx[i], 0) = full_r0.coeff(i, 0);
+      }
+    }
+
+    // Construct reduced_KKT
+    std::vector<Eigen::Triplet<Scalar>> triplets;
+    triplets.reserve(full_KKT.rows());
+    for (int j = 0; j < full_KKT.outerSize(); j++) {
+      for (SpMatrix::InnerIterator it(full_KKT, j); it; ++it) {
+        // Removing h and its corresponding mu (multiplier) together means
+        // removing same row and col
+        int new_row = old_to_new_idx[it.row()];
+        int new_col = old_to_new_idx[it.col()];
+        if (new_row != -1 && new_col != -1) {
+          triplets.emplace_back(new_row, new_col, it.value());
+        }
+      }
+    }
+
+    // KKT is a square matrix, same dim as r
+    SpMatrix reduced_KKT(reduced_r_dim, reduced_r_dim);
+    reduced_KKT.setFromTriplets(triplets.begin(), triplets.end());
+
+    return {reduced_KKT, reduced_r0, active_h_indices};
+  }
+
+  std::tuple<SpMatrix, std::vector<int>> reduce_Ki_system(const SpMatrix& Ki,
+                                                          const MatrixXd& h_i_val) {
+    // K_i uses the same ordering for residual rows and primal/dual variables,
+    // so removing an inactive h row and its corresponding mu column means
+    // keeping the same active index set on both axes.
+    const int h_in_r_offset = (n_ + m_) * T_ + n_ * T_;
+    assert(h_i_val.rows() * h_i_val.cols() == n_hi_);
+
+    std::vector<int> old_to_new_idx(Ki.rows(), -1);
+    std::vector<int> active_h_indices;
+    active_h_indices.reserve(n_hi_);
+    int reduced_dim = 0;
+
+    for (int i = 0; i < h_in_r_offset; ++i) {
+      old_to_new_idx[i] = reduced_dim++;
+    }
+
+    for (int i = 0; i < n_hi_; ++i) {
+      if (h_i_val(i, 0) >= 0.0) {
+        old_to_new_idx[h_in_r_offset + i] = reduced_dim++;
+        active_h_indices.push_back(i);
+      }
+    }
+
+    std::vector<Eigen::Triplet<Scalar>> triplets;
+    triplets.reserve(Ki.nonZeros());
+    for (int j = 0; j < Ki.outerSize(); ++j) {
+      for (SpMatrix::InnerIterator it(Ki, j); it; ++it) {
+        const int new_row = old_to_new_idx[it.row()];
+        const int new_col = old_to_new_idx[it.col()];
+        if (new_row != -1 && new_col != -1) {
+          triplets.emplace_back(new_row, new_col, it.value());
+        }
+      }
+    }
+
+    SpMatrix reduced_Ki(reduced_dim, reduced_dim);
+    reduced_Ki.setFromTriplets(triplets.begin(), triplets.end());
+    return {reduced_Ki, active_h_indices};
+  }
+
+  // Solve linear system of the form Ax = b
+  // Returns:
+  //   x: solution
+  //   res: residual, norm(Ax-b)
+  std::tuple<MatrixXd, Scalar> solve_linear_system(const SpMatrix& A, const MatrixXd& b,
+                                                   std::string method) {
+    if (method == "lscg") {
+      Eigen::LeastSquaresConjugateGradient<SpMatrix> solver;
+      solver.setTolerance(1e-5);
+      // solve r0 + Dr* dy = 0 least square
+      solver.compute(A);
+      // solver.compute(Dr.sparseView());
+
+      if (solver.info() != Eigen::Success) {
+        throw std::runtime_error(" solver initialization failed");
+        // return std::vector<std::vector<Matrix>>();
+      }
+
+      MatrixXd x = solver.solve(b);
+      if (solver.info() != Eigen::Success) {
+        logger_->info("LSCG solver failed ");
+      }
+      // NOTE this is relative error |Ax-b|/|Ax|, make sure it's consistent
+      // elsewhere
+      // TODO should we use dense matrix for x?
+      return {x, static_cast<Scalar>(solver.error())};
+    } else if (method == "ldl") {
+      // SimplicialLDLT is a direct sparse solver for P*A*P' = L*D*L'
+      // Note: Unlike qdldl Eigen defaults to reading the LOWER triangular part.
+      // If somehow using upper,
+      // change this to: Eigen::SimplicialLDLT<SpMatrix, Eigen::Upper> solver;
+      Eigen::SimplicialLDLT<SpMatrix> solver;
+
+      // A must be symmetric, symbolic LDL decomposition
+      // Consider reusing this, if A's structure doesn't change
+      // logger_->debug("Symbolic LDL decomp...");
+      assert((A - SpMatrix(A.transpose())).norm() < 1e-6);
+      solver.compute(A);
+
+      if (solver.info() != Eigen::Success) {
+        logger_->error("LDL decomposition failed");
+        throw std::runtime_error("LDL decomposition failed");
+      }
+
+      // Solve System (A * x = b)
+      // This automatically handles the permutations (P) internally
+      // logger_->debug("Solving...");
+      Eigen::VectorXd x = solver.solve(b);
+
+      // Get diagonal of matrix D from L*D*L'
+      // TODO does Eigen give 2 by 2 blocks?
+      Eigen::VectorXd D = solver.vectorD();
+
+      int pos = 0;
+      int neg = 0;
+      int zero = 0;
+
+      // Iterate through D to count signs
+      // logger_->debug("Checking inertia...");
+      /*
+      const double epsilon = 1e-8;
+      for (int i = 0; i < D.size(); ++i) {
+          if (D[i] > epsilon) pos++;
+          else if (D[i] < -epsilon) neg++;
+          else zero++;
+      }
+      auto inertia = std::make_tuple(pos, neg, zero);
+      */
+
+      const Scalar residual = (A * x - b).norm();
+
+      return {x, residual};
+    } else if (method == "lsqr") {
+      Eigen::SparseQR<SpMatrix, Eigen::COLAMDOrdering<SpMatrix::StorageIndex>> solver;
+
+      // Compute the QR factorization
+      solver.compute(A);
+
+      if (solver.info() != Eigen::Success) {
+        logger_->error("QR decomposition failed");
+        throw std::runtime_error("QR decomposition failed");
+      }
+
+      // Solves the least squares problem min ||Ax - b||
+      MatrixXd x = solver.solve(b);
+
+      if (solver.info() != Eigen::Success) {
+        logger_->error("QR solver failed during solve phase");
+      }
+
+      const Scalar residual = (A * x - b).norm();
+      return {x, residual};
+    } else if (method == "sparselu") {
+      // Built-in Eigen direct solver (no external dependencies)
+      Eigen::SparseLU<SpMatrix> solver;
+
+      solver.compute(A);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("SparseLU decomposition failed");
+        throw std::runtime_error("SparseLU decomposition failed");
+      }
+
+      MatrixXd x = solver.solve(b);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("SparseLU solver failed during solve phase");
+      }
+
+      const Scalar residual = (A * x - b).norm();
+      return {x, residual};
+
+    } else if (method == "superlu") {
+      // Requires: #include <Eigen/SuperLUSupport>
+      // Requires linking against the external SuperLU library
+      Eigen::SuperLU<SpMatrix> solver;
+
+      solver.compute(A);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("SuperLU decomposition failed");
+        throw std::runtime_error("SuperLU decomposition failed");
+      }
+
+      MatrixXd x = solver.solve(b);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("SuperLU solver failed during solve phase");
+      }
+
+      const Scalar residual = (A * x - b).norm();
+      return {x, residual};
+    } else if (method == "umfpack") {
+      // Requires: #include <Eigen/UmfPackSupport>
+      // Requires linking against SuiteSparse (umfpack, amd)
+      UmfSpMatrix A_umf = A;
+      Eigen::UmfPackLU<UmfSpMatrix> solver;
+
+      solver.compute(A_umf);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("UMFPACK decomposition failed");
+        throw std::runtime_error("UMFPACK decomposition failed");
+      }
+
+      MatrixXd x = solver.solve(b);
+      if (solver.info() != Eigen::Success) {
+        logger_->error("UMFPACK solver failed during solve phase");
+      }
+
+      const Scalar residual = (A * x - b).norm();
+      return {x, residual};
+    }
+    throw std::runtime_error("Unknown method type: " + method);
+  }
+
+  std::tuple<MatrixXd, Scalar> solve_preconditioned_system(const SpMatrix& LHS,
+                                                           const MatrixXd& RHS) {
+    const SpMatrix LHS_t = SpMatrix(LHS.transpose());
+    const SpMatrix S = (LHS + LHS_t) * 0.5;
+    const SpMatrix A = (LHS - LHS_t) * 0.5;
+
+    MatrixXd dy = MatrixXd::Zero(LHS.rows(), 1);
+    Scalar last_residual = std::numeric_limits<Scalar>::infinity();
+    Scalar total_residual = last_residual;
+
+    for (int i = 0; i < 10; ++i) {
+      MatrixXd iter_rhs = RHS - A * dy;
+      MatrixXd new_dy;
+      Scalar sym_residual;
+      std::tie(new_dy, sym_residual) = solve_linear_system(S, iter_rhs, "ldl");
+      (void)sym_residual;
+
+      total_residual = (LHS * new_dy - RHS).norm();
+      if (total_residual > last_residual) {
+        break;
+      }
+      dy = new_dy;
+      logger_->debug("Preconditioned iter total_residual={:.6f}", total_residual);
+      if (total_residual < 1e-2 || total_residual > 0.9 * last_residual) {
+        break;
+      }
+      last_residual = total_residual;
+    }
+    return {dy, total_residual};
+  }
+
+  // Solve dynamic game
+  // Returns:
+  // x
+  // u
+  // lamda
+  // mu
+  // residual
+  // has_converged
+  // is_optimal
+  // iterations
+  // msg
+  std::tuple<MatrixXd, MatrixXd, MatrixXd, MatrixXd, Scalar, bool, bool, int, std::string> solve(
+      py::array_t<double> x0, py::array_t<double> u_guess, py::array_t<double> int_param,
+      py::array_t<double> double_param) {
+    // Set input args
+    auto x0_val = x0.request();  // py::buffer_info
+    auto u_guess_val = u_guess.request();
+    auto int_param_val = int_param.request();
+    auto double_param_val = double_param.request();
+
+    // Call rollout(x0, u_guess, int_param, double_param) -> x
+    wb_.args[0] = static_cast<double*>(x0_val.ptr);
+    wb_.args[1] = static_cast<double*>(u_guess_val.ptr);
+    wb_.args[2] = static_cast<double*>(int_param_val.ptr);
+    wb_.args[3] = static_cast<double*>(double_param_val.ptr);
+    assert(rollout_.n_in() == 4);
+
+    casadi::Sparsity x_sp = rollout_.sparsity_out(0);
+    std::vector<double> x_buffer(x_sp.nnz());
+    wb_.res[0] = x_buffer.data();
+    assert(rollout_.n_out() == 1);
+
+    assert(x_sp.is_dense());
+    rollout_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;  // Avoid accidentally overwriting the buffer
+    Eigen::Map<MatrixXd> x(x_buffer.data(), x_sp.size1(), x_sp.size2());
+
+    // u_guess, dense
+    auto u = u_guess.cast<MatrixXd>();
+    MatrixXd lamda = MatrixXd::Zero(n_ * N_, T_);
+    // get context, get h_val, calculate slack variable s, mu
+    // Call get_full_context_(x) -> full_context_buffer
+    wb_.args[0] = static_cast<double*>(x.data());
+    assert(get_full_context_.n_in() == 1);
+    assert(get_full_context_.sparsity_in(0).is_dense());
+    casadi::Sparsity full_context_sp = get_full_context_.sparsity_out(0);
+    assert(full_context_sp.is_dense());
+    std::vector<Scalar> full_context_buffer(full_context_sp.nnz());
+    wb_.res[0] = full_context_buffer.data();
+    assert(get_full_context_.n_out() == 1);
+    get_full_context_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+
+    // Call h_(x, u, context, int_params, double_params) -> h_val_buffer
+    wb_.args[0] = static_cast<double*>(x.data());
+    wb_.args[1] = static_cast<double*>(u.data());
+    wb_.args[2] = static_cast<double*>(full_context_buffer.data());
+    wb_.args[3] = static_cast<double*>(int_param_val.ptr);
+    wb_.args[4] = static_cast<double*>(double_param_val.ptr);
+    assert(h_.n_in() == 5);
+    casadi::Sparsity h_val_sp = h_.sparsity_out(0);
+    std::vector<double> h_val_buffer(h_val_sp.nnz());
+    wb_.res[0] = h_val_buffer.data();
+    assert(h_.n_out() == 1);
+    h_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+
+    Scalar tau = 0.1;  // Perturbed complementary slackness mu * s = tau > 0, homotopy param -> 0
+    // Slack variable
+    MatrixXd s =
+        (-Eigen::Map<Eigen::MatrixXd>(h_val_buffer.data(), h_val_sp.size1() * h_val_sp.size2(), 1))
+            .cwiseMax(1e-2);
+    MatrixXd mu = tau * s.cwiseInverse();  // Multiplier for h(x,u) + s
+
+    std::vector<std::pair<Scalar, Scalar>> filter_state;  // Primal, dual residual
+    line_search_fail_count_ = 0;
+
+    bool converged = false;
+    bool optimal = false;
+    bool stop = false;
+    Scalar residual = 1e10;
+    residual_history_.clear();
+
+    int iter;
+    std::string msg{"no info"};
+    for (iter = 0; iter < max_iterations_; iter++) {
+      if (rollout_each_step_) {
+        // Call rollout(x0, u_guess, int_param, double_param) -> x
+        wb_.args[0] = static_cast<double*>(x0_val.ptr);
+        wb_.args[1] = static_cast<double*>(u.data());
+        wb_.args[2] = static_cast<double*>(int_param_val.ptr);
+        wb_.args[3] = static_cast<double*>(double_param_val.ptr);
+        assert(rollout_.n_in() == 4);
+        wb_.res[0] = x_buffer.data();
+        assert(rollout_.n_out() == 1);
+        rollout_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+        wb_.res[0] = nullptr;  // Avoid accidentally overwriting the buffer
+      }
+      std::tie(stop, converged, optimal, residual) =
+          step(x, u, lamda, mu, s, filter_state, tau, int_param, double_param);
+      residual_history_.push_back(residual);
+      logger_->info("converged={},optimal={},residual={:.5f}", converged, optimal, residual);
+      const Scalar current_gap = s.cwiseProduct(mu).sum() / static_cast<Scalar>(dual_h_dim_);
+      tau = max(1e-8, tau_decay_ * current_gap);
+      logger_->debug("Perturbed Complementary Slackness: tau={:.8f}", tau);
+      if (converged) break;
+      if (line_search_fail_count_ >= max_failed_line_search_ || stop) {
+        msg = "Line search no progress";
+        break;
+      }
+    }
+    if (msg == "no info") {
+      if (converged && optimal) {
+        msg = "Converged to NE";
+      } else if (converged && !optimal) {
+        msg = "Converged to saddle point";
+      }
+    }
+    // Return: x,  u,  lamda,  mu,  residual, converged,  optimal,
+    // iterations,  msg
+    return {x, u, lamda, mu, residual, converged, optimal, iter, msg};
+  }
+
+  // Take one Newton step, modify x,u,lamda,mu IN PLACE
+  // x_ref: n*N,T
+  // u_ref: m*N,T
+  // lamda: n*N,T
+  // mu: n_hi*N, 1
+  // Returns (stop, has_converged, is_optimal, residual)
+  std::tuple<bool, bool, bool, Scalar> step(Eigen::Ref<MatrixXd> x, Eigen::Ref<MatrixXd> u,
+                                            Eigen::Ref<MatrixXd> lamda, Eigen::Ref<MatrixXd> mu,
+                                            Eigen::Ref<MatrixXd> s,
+                                            std::vector<std::pair<Scalar, Scalar>>& filter_state,
+                                            const Scalar tau, py::array_t<double>& int_param,
+                                            py::array_t<double>& double_param) {
+    // Solve r0 + H @ dy = 0
+    // i.e. full_r0 + full_KKT @ <dx, du, dlambda, dmu> = 0
+    // identify inactive constraints (mu)
+    // skim down H, dy, remove inactive constraints, dual variables
+    // Solve for dy
+
+    // Call h_val(), r(), dr_dy() to get full_r0 and full_KKT
+    auto int_param_val = int_param.request();
+    auto double_param_val = double_param.request();
+    // Get game context
+    // Call get_full_context_(x)
+    wb_.args[0] = static_cast<double*>(x.data());
+    assert(get_full_context_.n_in() == 1);
+    assert(get_full_context_.sparsity_in(0).is_dense());
+    casadi::Sparsity full_context_sp = get_full_context_.sparsity_out(0);
+    assert(full_context_sp.is_dense());
+    std::vector<double> full_context_buffer(full_context_sp.nnz());
+    wb_.res[0] = full_context_buffer.data();
+    assert(get_full_context_.n_out() == 1);
+    if (!debug_got_vals_) {
+      debug_context = full_context_buffer;
+      debug_x = x;
+      debug_u = u;
+    }
+
+    get_full_context_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+
+    // logger_->debug("Getting r0 and KKT matrix...");
+    // Get residual
+    // full_r0 = r(x, u, lamda, mu, context, int_param, double_param)
+    wb_.args[0] = static_cast<double*>(x.data());
+    wb_.args[1] = static_cast<double*>(u.data());
+    wb_.args[2] = static_cast<double*>(lamda.data());
+    wb_.args[3] = static_cast<double*>(mu.data());
+    wb_.args[4] = static_cast<double*>(full_context_buffer.data());
+    wb_.args[5] = static_cast<double*>(int_param_val.ptr);
+    wb_.args[6] = static_cast<double*>(double_param_val.ptr);
+    assert(r_.n_in() == 7);
+    assert(r_.sparsity_in(0).is_dense());
+    assert(r_.sparsity_in(1).is_dense());
+    assert(r_.sparsity_in(2).is_dense());
+    assert(r_.sparsity_in(3).is_dense());
+    assert(r_.sparsity_in(4).is_dense());
+    assert(r_.sparsity_in(5).is_dense());
+    assert(r_.sparsity_in(6).is_dense());
+
+    // DEBUG, ensure no nan in input
+    if (x.hasNaN()) logger_->warn("x has nan");
+    if (u.hasNaN()) logger_->warn("u has nan");
+    if (lamda.hasNaN()) logger_->warn("lamda has nan");
+    if (mu.hasNaN()) logger_->warn("mu has nan");
+    if (std::any_of(full_context_buffer.begin(), full_context_buffer.end(),
+                    [](double x) { return std::isnan(x); })) {
+      logger_->warn("full_context has nan");
+    }
+
+    casadi::Sparsity full_r0_sp = r_.sparsity_out(0);
+    assert(full_r0_sp.is_dense());
+    std::vector<double> full_r0_buffer(full_r0_sp.nnz());
+    wb_.res[0] = full_r0_buffer.data();
+
+    casadi::Sparsity h_val_sp = r_.sparsity_out(1);
+    std::vector<double> h_val_buffer(h_val_sp.nnz());
+    wb_.res[1] = h_val_buffer.data();
+    assert(r_.n_out() == 2);
+
+    r_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+    wb_.res[1] = nullptr;
+
+    auto full_r0 = get_mapped_spmatrix(full_r0_sp, full_r0_buffer.data());
+    assert(h_val_sp.is_dense());
+    // auto h_val = get_mapped_spmatrix(h_val_sp, h_val_buffer.data());
+    Eigen::Map<MatrixXd> h_val(h_val_buffer.data(), h_val_sp.size1(), h_val_sp.size2());
+
+    // Get Game Jacobian
+    // Call full_KKT = dr_dy(x, u, lamda, mu, context, int_param, double_param)
+    // Same input as r() call
+    assert(dr_dy_.n_in() == 7);
+    assert(dr_dy_.sparsity_in(0).is_dense());
+    assert(dr_dy_.sparsity_in(1).is_dense());
+    assert(dr_dy_.sparsity_in(2).is_dense());
+    assert(dr_dy_.sparsity_in(3).is_dense());
+    assert(dr_dy_.sparsity_in(4).is_dense());
+    assert(dr_dy_.sparsity_in(5).is_dense());
+    assert(dr_dy_.sparsity_in(6).is_dense());
+
+    casadi::Sparsity full_KKT_sp = dr_dy_.sparsity_out(0);
+    std::vector<double> full_KKT_buffer(full_KKT_sp.nnz());
+    wb_.res[0] = full_KKT_buffer.data();
+    assert(dr_dy_.n_out() == 1);
+
+    dr_dy_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+    wb_.res[0] = nullptr;
+
+    // Copy here because mapped SpMatrix is read-only, but we need to modify it
+    // later
+    SpMatrix full_KKT = get_mapped_spmatrix(full_KKT_sp, full_KKT_buffer.data());
+    check_spmatrix_has_nan(full_KKT, "full_KKT");
+    MatrixXd full_rhs = -MatrixXd(full_r0);
+    const int mu_offset = n_ * N_ * T_ + m_ * N_ * T_ + n_ * N_ * T_;
+    for (int i = 0; i < dual_h_dim_; ++i) {
+      const Scalar slack_ratio = -s(i, 0) / mu(i, 0);
+      full_KKT.coeffRef(mu_offset + i, mu_offset + i) += slack_ratio;
+      full_rhs(mu_offset + i, 0) += -tau / mu(i, 0);
+    }
+    const int primal_var_count = (n_ + m_) * N_ * T_;
+    if (abs_split_) {
+      full_KKT = apply_abs_split_to_full_KKT(full_KKT, primal_var_count);
+    }
+    // Check inertia for each agent KKT matrix Ki
+    bool is_optimal = true;
+    std::vector<int> saddle_agent_vec;
+    saddle_agent_vec.reserve(N_);
+    std::vector<Scalar> reg_vec(N_, 0);
+
+    const int primal_n = (n_ + m_) * T_;
+
+    for (int i = 0; i < N_; i++) {
+      // Call K_i
+      casadi::Sparsity Ki_sp = Ki_vec_[i].sparsity_out(0);
+      std::vector<double> Ki_buffer(Ki_sp.nnz());
+      wb_.res[0] = Ki_buffer.data();
+      assert(Ki_vec_[i].n_out() == 1);
+      auto Ki = get_mapped_spmatrix(Ki_sp, Ki_buffer.data());
+
+      // The arguments are the same as r, dr_dy. No need to reset wb_.args
+      Ki_vec_[i](wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+      wb_.res[0] = nullptr;
+      SpMatrix Ki_for_inertia = Ki;
+      int active_h_count = n_hi_;
+      if (keep_only_active_constraints_in_ki_) {
+        const int h_col = variational_gne_ ? 0 : i;
+        MatrixXd h_i_val = h_val.col(h_col);
+        std::vector<int> active_h_indices;
+        std::tie(Ki_for_inertia, active_h_indices) = reduce_Ki_system(Ki_for_inertia, h_i_val);
+        active_h_count = active_h_indices.size();
+      }
+
+      // Apply Levenberg-Marquardt Regularization
+      // Without this AMD permutation will fail
+      int rows = Ki_for_inertia.rows();
+      int cols = Ki_for_inertia.cols();
+      std::vector<Eigen::Triplet<double>> triplets;
+      triplets.reserve(rows);
+      for (int k = 0; k < rows; ++k) {
+        // Primal (+reg), Dual/Constraints (-reg)
+        double val = (k < primal_n) ? reg_inertia_ : -reg_inertia_;
+        triplets.emplace_back(k, k, val);
+      }
+      SpMatrix reg_matrix(rows, cols);
+      reg_matrix.setFromTriplets(triplets.begin(), triplets.end());
+      SpMatrix Ki_reg = Ki_for_inertia + reg_matrix;
+
+      std::vector<Eigen::Triplet<double>> I_H_triplets;
+      I_H_triplets.reserve(primal_n);
+      for (int k = 0; k < primal_n; ++k) {
+        I_H_triplets.emplace_back(k, k, 1.0);
+      }
+      SpMatrix I_H(rows, cols);
+      I_H.setFromTriplets(I_H_triplets.begin(), I_H_triplets.end());
+      // LDL decomposition
+      Eigen::SimplicialLDLT<SpMatrix> solver;
+      solver.analyzePattern(Ki_reg);  // .compute() without .factorize()
+      auto inertia = get_inertia(Ki_reg, solver);
+      auto expected_inertia = std::make_tuple(primal_n, n_ * T_ + active_h_count, 0);
+      if (inertia != expected_inertia) {
+        // TODO use different regularization for inertia checking
+        is_optimal = false;
+        saddle_agent_vec.push_back(i);
+        if (inertia_correction_ || inertia_correction_classic_) {
+          // Old strategy: Find missing positive eigenvalue count, use pivot
+          // This is often not enough to correct inertia
+          // int bad_in_count = std::get<0>(expected_inertia) -
+          // std::get<0>(inertia);
+          // // NOTE neg_pivot_vec is uninitialized
+          // std::sort(neg_pivot_vec.begin(), neg_pivot_vec.end());
+          // reg_vec[i] = - neg_pivot_vec[bad_in_count-1];
+
+          if (inertia_correction_classic_) {
+            Scalar reg = inertia_correction_classic_start_;
+            auto reg_inertia = get_inertia(Ki_reg + reg * I_H, solver);
+            for (int reg_iter = 0; reg_iter < max_in_reg_iter_; reg_iter++) {
+              if (reg_inertia == expected_inertia) {
+                break;
+              }
+              reg *= inertia_correction_classic_scale_;
+              reg_inertia = get_inertia(Ki_reg + reg * I_H, solver);
+            }
+            if (reg_inertia != expected_inertia) {
+              logger_->warn("Failed to correct K_{} inertia with classic correction", i);
+            }
+            reg_vec[i] = reg;
+          } else {
+            Scalar reg_upper = 2.0;
+            Scalar reg_lower = 1.0;
+            auto reg_upper_in = get_inertia(Ki_reg + reg_upper * I_H, solver);
+            auto reg_lower_in = get_inertia(Ki_reg + reg_lower * I_H, solver);
+            for (int reg_iter = 0; reg_iter < max_in_reg_iter_; reg_iter++) {
+              if (reg_upper_in != expected_inertia) {
+                reg_lower = reg_upper;
+                reg_lower_in = reg_upper_in;
+                reg_upper *= 2;
+                reg_upper_in = get_inertia(Ki_reg + reg_upper * I_H, solver);
+              } else if (reg_lower_in == expected_inertia) {
+                reg_upper = reg_lower;
+                reg_upper_in = reg_lower_in;
+                reg_lower /= 2;
+                reg_lower_in = get_inertia(Ki_reg + reg_lower * I_H, solver);
+              } else {
+                Scalar reg_middle = (reg_upper + reg_lower) / 2;
+                auto reg_middle_in = get_inertia(Ki_reg + reg_middle * I_H, solver);
+                if (reg_middle_in == expected_inertia) {
+                  reg_upper = reg_middle;
+                  reg_upper_in = reg_middle_in;
+                } else {
+                  reg_lower = reg_middle;
+                  reg_lower_in = reg_middle_in;
+                }
+              }
+              if ((reg_upper - reg_lower) / reg_upper < 1e-4) {
+                break;
+              }
+              if (reg_upper > max_in_reg_val_) {
+                reg_upper = max_in_reg_val_;
+                break;
+              }
+            }
+            if (reg_upper_in != expected_inertia) {
+              logger_->warn("Failed to correct K_{} inertia", i);
+            }
+            reg_vec[i] = reg_upper + inertia_correction_base_;
+          }
+        }
+      }
+    }
+    logger_->info("Saddle agents: {}", saddle_agent_vec);
+
+    const bool use_pdo_split = precondition_with_potential_ && ablation_level_ == 0;
+    if (use_pdo_split) {
+      reg_ = reg_inertia_;
+    }
+
+    // Apply Levenberg-Marquardt regularization to the full game KKT.
+    {
+      const int rows = full_KKT.rows();
+      std::vector<Eigen::Triplet<double>> reg_triplets;
+      reg_triplets.reserve(rows);
+      for (int k = 0; k < rows; ++k) {
+        const double val = (k < primal_var_count) ? reg_ : -reg_;
+        reg_triplets.emplace_back(k, k, val);
+      }
+      SpMatrix reg_matrix(rows, rows);
+      reg_matrix.setFromTriplets(reg_triplets.begin(), reg_triplets.end());
+      full_KKT += reg_matrix;
+    }
+
+    if (inertia_correction_ || inertia_correction_classic_) {
+      full_KKT += make_full_KKT_reg(reg_vec);
+    }
+
+    MatrixXd full_dy;
+    Scalar residual;
+    if (use_pdo_split) {
+      std::tie(full_dy, residual) = solve_preconditioned_system(full_KKT, full_rhs);
+      logger_->info("Preconditioned KKT residual={:.5f}", residual);
+    } else if (ablation_level_ == 2) {
+      // The game KKT is generally nonsymmetric. Convert only for this ablation
+      // and solve with dense LU with partial pivoting, including conversion in timing.
+      const MatrixXd dense_KKT(full_KKT);
+      full_dy = dense_KKT.partialPivLu().solve(full_rhs);
+      residual = (dense_KKT * full_dy - full_rhs).norm();
+    } else {
+      const std::string method = ablation_level_ == 1 ? "sparselu" : linear_solver_method_;
+      std::tie(full_dy, residual) = solve_linear_system(full_KKT, full_rhs, method);
+    }
+    logger_->debug("full_dy sq_norm {:.5f}", pow(full_dy.norm(), 2));
+
+    // Line Search, regularization bloating
+    Scalar step = 1.0;
+    const int x_dim = n_ * N_ * T_;
+    const int u_dim = m_ * N_ * T_;
+    const int lamda_dim = n_ * N_ * T_;
+    const int mu_dim = dual_h_dim_;
+    const MatrixXd dx = full_dy.block(0, 0, x_dim, 1);
+    const MatrixXd du = full_dy.block(x_dim, 0, u_dim, 1);
+    const MatrixXd dlamda = full_dy.block(x_dim + u_dim, 0, lamda_dim, 1);
+    const MatrixXd dmu = full_dy.block(x_dim + u_dim + lamda_dim, 0, mu_dim, 1);
+    MatrixXd ds = -s + (MatrixXd::Constant(mu_dim, 1, tau) - s.cwiseProduct(dmu)).cwiseQuotient(mu);
+    Scalar alpha_p = 1.0;
+    Scalar alpha_d = 1.0;
+    for (int i = 0; i < mu_dim; ++i) {
+      if (ds(i, 0) < 0.0) {
+        alpha_p = min(alpha_p, -0.995 * s(i, 0) / ds(i, 0));
+      }
+      if (dmu(i, 0) < 0.0) {
+        alpha_d = min(alpha_d, -0.995 * mu(i, 0) / dmu(i, 0));
+      }
+    }
+    alpha_p = alpha_d = min(alpha_p, alpha_d);
+    logger_->debug("Max step size primal: {:.8f}, dual: {:.8f}", alpha_p, alpha_d);
+    MatrixXd new_x(n_ * N_, T_);
+    MatrixXd new_u(m_ * N_, T_);
+    MatrixXd new_lamda(n_ * N_, T_);
+    MatrixXd new_mu(dual_h_dim_, 1);
+    MatrixXd new_s(dual_h_dim_, 1);
+    int ls_iter;
+    MatrixXd full_r(full_r0.rows() + mu_dim, 1);
+    full_r.block(0, 0, full_r0.rows(), 1) = MatrixXd(full_r0);
+    full_r.block(full_r0.rows(), 0, mu_dim, 1) =
+        mu.cwiseProduct(s) - MatrixXd::Constant(mu_dim, 1, tau);
+    full_r.block(mu_offset, 0, mu_dim, 1) += s;
+    const Scalar comp_res = full_r.block(full_r0.rows(), 0, mu_dim, 1).lpNorm<1>();
+    const Scalar primal_res =
+        full_r.block(x_dim + u_dim + lamda_dim, 0, mu_dim + mu_dim, 1).lpNorm<1>() - comp_res;
+    const Scalar dual_res = full_r.block(0, 0, x_dim + u_dim, 1).lpNorm<1>() + comp_res;
+    Scalar trial_primal_res = primal_res;
+    Scalar trial_dual_res = dual_res;
+    if (filter_state.empty()) {
+      filter_state.emplace_back(max(primal_res * 1.2, static_cast<Scalar>(1e4)),
+                                -std::numeric_limits<Scalar>::infinity());
+    }
+    for (ls_iter = 0; ls_iter < line_search_max_iter_; ls_iter++) {
+      new_x = x + step * alpha_p * dx.reshaped(n_ * N_, T_);
+      new_u = u + step * alpha_p * du.reshaped(m_ * N_, T_);
+      new_lamda = lamda + step * alpha_d * dlamda.reshaped(n_ * N_, T_);
+      new_mu = mu + step * alpha_d * dmu.reshaped(mu_dim, 1);
+      new_s = s + step * alpha_p * ds;
+
+      // Get game context
+      // Call get_full_context_(x)
+      wb_.args[0] = static_cast<double*>(new_x.data());
+      assert(get_full_context_.n_in() == 1);
+      assert(get_full_context_.sparsity_in(0).is_dense());
+      wb_.res[0] = full_context_buffer.data();
+      assert(get_full_context_.n_out() == 1);
+
+      get_full_context_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+      wb_.res[0] = nullptr;
+
+      wb_.args[0] = static_cast<double*>(new_x.data());
+      wb_.args[1] = static_cast<double*>(new_u.data());
+      wb_.args[2] = static_cast<double*>(new_lamda.data());
+      wb_.args[3] = static_cast<double*>(new_mu.data());
+      wb_.args[4] = static_cast<double*>(full_context_buffer.data());
+      wb_.args[5] = static_cast<double*>(int_param_val.ptr);
+      wb_.args[6] = static_cast<double*>(double_param_val.ptr);
+      assert(r_.sparsity_in(0).is_dense());
+      assert(r_.sparsity_in(1).is_dense());
+      assert(r_.sparsity_in(2).is_dense());
+      assert(r_.sparsity_in(3).is_dense());
+      assert(r_.sparsity_in(4).is_dense());
+      assert(r_.sparsity_in(5).is_dense());
+      assert(r_.sparsity_in(6).is_dense());
+      assert(r_.n_in() == 7);
+
+      std::vector<double> new_r_buffer(full_r0_sp.nnz());
+      wb_.res[0] = new_r_buffer.data();
+      wb_.res[1] = nullptr;  // Discard h_val output
+      assert(r_.n_out() == 2);
+
+      r_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+      wb_.res[0] = nullptr;
+
+      auto new_r = get_mapped_spmatrix(full_r0_sp, new_r_buffer.data());
+      MatrixXd trial_full_r(new_r.rows() + mu_dim, 1);
+      trial_full_r.block(0, 0, new_r.rows(), 1) = MatrixXd(new_r);
+      trial_full_r.block(new_r.rows(), 0, mu_dim, 1) =
+          new_mu.cwiseProduct(new_s) - MatrixXd::Constant(mu_dim, 1, tau);
+      trial_full_r.block(mu_offset, 0, mu_dim, 1) += new_s;
+      const Scalar trial_comp_res = trial_full_r.block(new_r.rows(), 0, mu_dim, 1).lpNorm<1>();
+      trial_primal_res =
+          trial_full_r.block(x_dim + u_dim + lamda_dim, 0, mu_dim + mu_dim, 1).lpNorm<1>() -
+          trial_comp_res;
+      trial_dual_res = trial_full_r.block(0, 0, x_dim + u_dim, 1).lpNorm<1>() + trial_comp_res;
+      logger_->debug("step={:.8f}, trial_primal_res={:.5f}, trial_dual_res={:.5f}", step,
+                     trial_primal_res, trial_dual_res);
+
+      const bool improve_optimality = trial_dual_res < dual_res - bc_a_ * primal_res;
+      const bool improve_feasibility = trial_primal_res < (1 - bc_a_) * primal_res;
+      if (!improve_optimality && !improve_feasibility) {
+        step *= bc_b_;
+        continue;
+      }
+
+      bool is_dominated = false;
+      for (const auto& [filter_primal_res, filter_dual_res] : filter_state) {
+        const bool filter_improve_optimality =
+            trial_dual_res < filter_dual_res - bc_a_ * filter_primal_res;
+        const bool filter_improve_feasibility = trial_primal_res < (1 - bc_a_) * filter_primal_res;
+        if (!filter_improve_optimality && !filter_improve_feasibility) {
+          is_dominated = true;
+          break;
+        }
+      }
+      if (is_dominated) {
+        step *= bc_b_;
+        continue;
+      }
+
+      if (!improve_optimality && improve_feasibility) {
+        filter_state.emplace_back(max(static_cast<Scalar>(1e-4), primal_res), dual_res);
+      }
+      break;
+    }
+    if (ls_iter == line_search_max_iter_) {
+      reg_ = min(reg_ * 10.0, 0.1);
+      step = 0.0;
+      line_search_fail_count_++;
+      new_x = x;
+      new_u = u;
+      new_lamda = lamda;
+      new_mu = mu;
+      new_s = s;
+      trial_primal_res = primal_res;
+      trial_dual_res = dual_res;
+      logger_->debug("Line Search no progress, inflating reg to {:.5f}", reg_);
+    } else {
+      reg_ = reg0_;
+      line_search_fail_count_ = 0;
+    }
+    logger_->debug("Line search stopped after {}/{} iterations", ls_iter + 1,
+                   line_search_max_iter_);
+    logger_->debug("Step size = {:.5f}", step);
+    bool stop = line_search_fail_count_ >= max_failed_line_search_;
+
+    x = new_x;
+    u = new_u;
+    lamda = new_lamda;
+    mu = new_mu;
+    s = new_s;
+
+    const Scalar total_residual = trial_primal_res + trial_dual_res;
+    bool has_converged = total_residual < tolerance_;
+    if (!debug_got_vals_) {
+      debug_full_KKT_ = full_KKT;
+      debug_full_r0_ = full_rhs.sparseView();
+      debug_full_dy = full_dy;
+      debug_got_vals_ = true;
+    }
+
+    // Returns (has_converged, is_optimal, residual)
+    return {stop, has_converged, is_optimal, total_residual};
+  }
+
+  SparseMatrixResult debug_get_full_KKT() { return get_spr(debug_full_KKT_); }
+  SparseMatrixResult debug_get_full_r0() { return get_spr(debug_full_r0_); }
+  std::vector<Scalar> get_residual_history() const { return residual_history_; }
+  std::vector<double> debug_get_context() { return debug_context; }
+  MatrixXd debug_get_x() { return debug_x; }
+  MatrixXd debug_get_u() { return debug_u; }
+  MatrixXd debug_get_full_dy() { return debug_full_dy; }
+
+  SparseMatrixResult get_spr(const SpMatrix& mtx) {
+    SparseMatrixResult res;
+    res.shape = {mtx.rows(), mtx.cols()};
+    res.data.assign(mtx.valuePtr(), mtx.valuePtr() + mtx.nonZeros());
+    res.row.assign(mtx.innerIndexPtr(), mtx.innerIndexPtr() + mtx.nonZeros());
+    res.colind.assign(mtx.outerIndexPtr(), mtx.outerIndexPtr() + mtx.outerSize() + 1);
+    return res;
+  }
+
+  SpMatrix extract_sparse_block(const SpMatrix& mtx, int row_offset, int col_offset, int rows,
+                                int cols) {
+    std::vector<Eigen::Triplet<Scalar>> triplets;
+    triplets.reserve(mtx.nonZeros());
+    for (int j = col_offset; j < col_offset + cols; ++j) {
+      for (SpMatrix::InnerIterator it(mtx, j); it; ++it) {
+        if (it.row() >= row_offset && it.row() < row_offset + rows) {
+          triplets.emplace_back(it.row() - row_offset, j - col_offset, it.value());
+        }
+      }
+    }
+    SpMatrix block(rows, cols);
+    block.setFromTriplets(triplets.begin(), triplets.end());
+    return block;
+  }
+
+  SpMatrix extract_upper_triangle(const SpMatrix& mtx) {
+    std::vector<Eigen::Triplet<Scalar>> triplets;
+    triplets.reserve(mtx.nonZeros());
+    for (int j = 0; j < mtx.outerSize(); ++j) {
+      for (SpMatrix::InnerIterator it(mtx, j); it; ++it) {
+        if (it.row() <= j) {
+          triplets.emplace_back(it.row(), j, it.value());
+        }
+      }
+    }
+    SpMatrix upper(mtx.rows(), mtx.cols());
+    upper.setFromTriplets(triplets.begin(), triplets.end());
+    upper.makeCompressed();
+    return upper;
+  }
+
+  std::pair<SpMatrix, bool> make_abs_split_hessian_block(const SpMatrix& H) {
+    const int n = H.rows();
+    if (n == 0) {
+      return {H, false};
+    }
+
+    const SpMatrix H_t = SpMatrix(H.transpose());
+    const SpMatrix S = (H + H_t) * 0.5;
+    const SpMatrix A = (H - H_t) * 0.5;
+    const SpMatrix S_upper = extract_upper_triangle(S);
+
+    bool factorized = false;
+    Scalar shift_used = 0.0;
+    Eigen::SimplicialLDLT<SpMatrix, Eigen::Upper> solver;
+    solver.analyzePattern(S_upper);
+    for (const Scalar shift : {0.0, 1e-12, 1e-10, 1e-8, 1e-6}) {
+      solver.setShift(shift);
+      solver.factorize(S_upper);
+      if (solver.info() != Eigen::Success) {
+        continue;
+      }
+
+      shift_used = shift;
+      factorized = true;
+      break;
+    }
+    if (!factorized) {
+      logger_->warn("abs_split skipped because SimplicialLDLT factorization failed");
+      return {H, false};
+    }
+
+    const Eigen::VectorXd D = solver.vectorD();
+    bool all_positive = true;
+    for (int i = 0; i < n; ++i) {
+      if (D[i] <= 0.0) {
+        all_positive = false;
+        break;
+      }
+    }
+    if (shift_used == 0.0 && all_positive) {
+      return {H, false};
+    }
+
+    std::vector<Eigen::Triplet<Scalar>> abs_diag_triplets;
+    abs_diag_triplets.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      abs_diag_triplets.emplace_back(i, i, std::abs(D[i]));
+    }
+    SpMatrix D_abs(n, n);
+    D_abs.setFromTriplets(abs_diag_triplets.begin(), abs_diag_triplets.end());
+
+    const SpMatrix LD = solver.matrixL() * D_abs;
+    const SpMatrix S_abs_perm = LD * solver.matrixU();
+    const SpMatrix S_abs =
+        SpMatrix(solver.permutationP().transpose() * S_abs_perm * solver.permutationP());
+    const SpMatrix H_abs = S_abs + A;
+    return {H_abs, true};
+  }
+
+  SpMatrix apply_abs_split_to_full_KKT(const SpMatrix& full_KKT, int primal_var_count) {
+    const SpMatrix H = extract_sparse_block(full_KKT, 0, 0, primal_var_count, primal_var_count);
+    SpMatrix H_abs;
+    bool modified;
+    std::tie(H_abs, modified) = make_abs_split_hessian_block(H);
+    if (!modified) {
+      return full_KKT;
+    }
+
+    std::vector<Eigen::Triplet<Scalar>> triplets;
+    triplets.reserve(full_KKT.nonZeros() + H_abs.nonZeros());
+    for (int j = 0; j < full_KKT.outerSize(); ++j) {
+      for (SpMatrix::InnerIterator it(full_KKT, j); it; ++it) {
+        if (it.row() < primal_var_count && it.col() < primal_var_count) {
+          continue;
+        }
+        triplets.emplace_back(it.row(), it.col(), it.value());
+      }
+    }
+    for (int j = 0; j < H_abs.outerSize(); ++j) {
+      for (SpMatrix::InnerIterator it(H_abs, j); it; ++it) {
+        triplets.emplace_back(it.row(), it.col(), it.value());
+      }
+    }
+    SpMatrix replaced(full_KKT.rows(), full_KKT.cols());
+    replaced.setFromTriplets(triplets.begin(), triplets.end());
+    return replaced;
+  }
+
+  bool check_spmatrix_has_nan(const SpMatrix& mtx, std::string name) {
+    bool has_nan = false;
+    const double* values = mtx.valuePtr();
+    for (int i = 0; i < mtx.nonZeros(); ++i) {
+      if (std::isnan(values[i])) {
+        has_nan = true;
+        break;
+      }
+    }
+    if (has_nan) {
+      logger_->warn(name + " has nan");
+    }
+    return has_nan;
+  }
+
+  // Make regularization matrix given regularization coefficient from each agent
+  SpMatrix make_full_KKT_reg(const std::vector<double>& reg_vec) {
+    int l = n_ * N_ * T_ + m_ * N_ * T_ + n_ * N_ * T_ + dual_h_dim_;
+
+    typedef Eigen::Triplet<Scalar> T;
+    std::vector<T> triplet_list;
+    triplet_list.reserve(N_ * T_ * (n_ + m_));
+
+    for (int i = 0; i < N_; ++i) {
+      Scalar val = reg_vec[i];
+
+      for (int k = 0; k < T_; ++k) {
+        // Block 1: dLLi/dxi
+        int x_offset = k * (n_ * N_) + i * n_;
+        for (int idx = 0; idx < n_; ++idx) {
+          int row_idx = x_offset + idx;
+          // Diagonal matrix, so col_idx == row_idx
+          triplet_list.push_back(T(row_idx, row_idx, val));
+        }
+
+        // Block 1: dLLi/dxi
+        int u_offset = n_ * N_ * T_ + k * (m_ * N_) + i * m_;
+        for (int idx = 0; idx < m_; ++idx) {
+          int row_idx = u_offset + idx;
+          triplet_list.push_back(T(row_idx, row_idx, val));
+        }
+      }
+    }
+
+    SpMatrix reg_mtx(l, l);
+    reg_mtx.setFromTriplets(triplet_list.begin(), triplet_list.end());
+    return reg_mtx;
+  }
+
+  // Find the inertia of a matrix
+  // Args:
+  //  solver: solver instance with symbolic factorization done.
+  //        Caller must ensure identical sparsity pattern
+  // Return:
+  //  inertia tuple
+  std::tuple<int, int, int> get_inertia(const SpMatrix& mtx,
+                                        Eigen::SimplicialLDLT<SpMatrix>& solver) {
+    solver.factorize(mtx);
+    // Eigen::SimplicialLDLT<SpMatrix> solver;
+    // solver.compute(mtx);
+    if (solver.info() != Eigen::Success) {
+      logger_->error("LDL decomposition failed");
+      throw std::runtime_error("LDL decomposition failed");
+    }
+    // Check Inertia
+    const auto& D = solver.vectorD();
+    int pos = 0;
+    int neg = 0;
+    int zero = 0;
+    const double epsilon = 1e-8;
+    for (int i = 0; i < D.size(); ++i) {
+      if (D[i] > epsilon) {
+        pos++;
+      } else if (D[i] < -epsilon) {
+        neg++;
+      } else
+        zero++;
+    }
+    return std::make_tuple(pos, neg, zero);
+  }
+
+  // Evaluate rollout function from casadi using python arguments.
+  MatrixXd casadi_rollout(py::array_t<double> x0, py::array_t<double> u,
+                          py::array_t<double> int_param, py::array_t<double> double_param) {
+    // Set input args
+    auto x0_val = x0.request();  // py::buffer_info
+    auto u_val = u.request();
+    auto int_param_val = int_param.request();
+    auto double_param_val = double_param.request();
+
+    wb_.args[0] = static_cast<double*>(x0_val.ptr);
+    wb_.args[1] = static_cast<double*>(u_val.ptr);
+    wb_.args[2] = static_cast<double*>(int_param_val.ptr);
+    wb_.args[3] = static_cast<double*>(double_param_val.ptr);
+    assert(rollout_.n_in() == 4);
+
+    const casadi::Sparsity& res_sp = rollout_.sparsity_out(0);  // 0th output sparsity
+    // Allocate output buffer
+    std::vector<double> res_buffer(res_sp.nnz());
+    wb_.res[0] = res_buffer.data();
+    assert(rollout_.n_out() == 1);
+    assert(res_sp.is_dense());
+
+    // Call work function
+    rollout_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+
+    // SparseMatrixResult res;
+    // res.shape = res_sp.size();
+    // res.data = res_buffer;
+    // res.row.assign(res_sp.row(), res_sp.row() + res_sp.nnz());
+    // res.colind.assign(res_sp.colind(), res_sp.colind() + res_sp.size2() + 1);
+    Eigen::Map<MatrixXd> res(res_buffer.data(), res_sp.size1(), res_sp.size2());
+    return res;
+  }
+
+  // Evaluate get_full_context function from casadi using python arguments.
+  MatrixXd get_full_context(py::array_t<double> x) {
+    auto x_val = x.request();
+
+    wb_.args[0] = static_cast<double*>(x_val.ptr);
+    assert(get_full_context_.n_in() == 1);
+
+    const casadi::Sparsity& res_sp = get_full_context_.sparsity_out(0);
+    std::vector<double> res_buffer(res_sp.nnz());
+    wb_.res[0] = res_buffer.data();
+    assert(get_full_context_.n_out() == 1);
+    assert(res_sp.is_dense());
+
+    get_full_context_(wb_.args.data(), wb_.res.data(), wb_.iw.data(), wb_.w.data(), 0);
+
+    Eigen::Map<MatrixXd> res(res_buffer.data(), res_sp.size1(), res_sp.size2());
+    return res;
+  }
+};

@@ -1,0 +1,58 @@
+# Shared defaults for single runs, code generation, and comparison benchmarks.
+[run]
+backend = "cpp"
+horizon = 20
+iterations = 20
+tolerance = 5e-4
+seed = 0
+restarts = 0
+restart_std = []
+ablation_level = 0
+
+[benchmark]
+runs = 100
+min_cars = 2
+max_cars = 8
+solvers = ["cps", "rd3g", "algames"]
+
+[games.merge]
+car_count = 6
+
+[games.intersection]
+car_count = 6
+
+[games.racing]
+car_count = 4
+
+[solvers.cps]
+variational_gne = true
+abs_split = true
+precondition_with_potential = false
+inertia_correction = false
+inertia_correction_classic = true
+
+[solvers.pdo]
+variational_gne = true
+abs_split = false
+precondition_with_potential = true
+inertia_correction = true
+inertia_correction_classic = false
+
+[solvers.ipm]
+variational_gne = true
+abs_split = false
+precondition_with_potential = false
+inertia_correction = false
+inertia_correction_classic = false
+
+[solvers.rd3g]
+inertia_correction = false
+
+[solvers.algames]
+warmup_solve = true
+persistent_worker = true
+
+[solvers.ilqgame]
+variational_gne = true
+step_size = 0.5
+barrier_weight = 1e-2
